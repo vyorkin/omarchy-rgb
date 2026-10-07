@@ -259,6 +259,15 @@ Pick one with `omarchy-rgb lcdtheme <id>` or from the buttons in the popup; the
 choice is kept in the plugin's state, and the theme hook rebuilds the colours from
 the new palette while leaving your layout alone.
 
+Every layout is checked before it goes to the screen: `bin/lcd_themes.py --check`
+reports text that does not fit its box, boxes that leave the panel and boxes that
+overlap, and `lcdtheme` refuses to install a layout that fails. That matters because
+a widget's box is also the area the display clears before drawing: with a box smaller
+than the text, the previous digits stay on screen and the numbers appear to pile up on
+each other. Sizes are computed from the font rather than guessed, values show no unit
+(the label carries it, so three digits always fit) and the font is dropped to 92 px in
+the grid instead of 104 so that four cells do not touch.
+
 Every text colour is checked against the background and lightened until it clears a
 contrast of 7:1 for values and 5:1 for labels (WCAG, the same measure browsers use).
 That check exists because it caught a real case: a palette painted all four values

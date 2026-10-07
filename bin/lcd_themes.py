@@ -119,14 +119,28 @@ def label(widget_id: str, text: str, x: float, y: float, size: float, color, wid
     }
 
 
+def value_box(size: float, digits: int = 3, margin: float = 1.15) -> tuple[float, float]:
+    """Рамка под число с запасом.
+
+    Ширина считается по шрифту, а не на глаз: если рамка меньше нарисованного
+    текста, дисплей затирает только её, и прежние цифры остаются на экране —
+    выглядит как наложенные друг на друга символы. Единицу измерения поэтому
+    показывает подпись, а значение занимает не больше трёх знаков.
+    """
+    width = size * 0.7 * digits * margin
+    height = size * 1.3 * margin
+    return round(width), round(height)
+
+
 def value(widget_id: str, source, x: float, y: float, size: float, color,
-          unit: str = "", width: float = 220, value_max: float = 100):
+          unit: str = "", width: float | None = None, value_max: float = 100):
+    box_width, box_height = value_box(size)
     return {
         "id": widget_id,
         "kind": {"type": "value_text", "source": source, "format": "{:.0}", "unit": unit,
                  "font": {}, "font_size": size, "color": with_alpha(color), "align": "center",
                  "value_min": 0, "value_max": value_max},
-        "x": x, "y": y, "width": width, "height": size * 1.3,
+        "x": x, "y": y, "width": width or box_width, "height": box_height,
     }
 
 
@@ -156,71 +170,76 @@ def gauge(widget_id: str, source, x: float, y: float, size: float, color, backgr
 
 def theme_grid(sources: dict, background, labels, values) -> tuple[str, str, list]:
     widgets = []
-    positions = {
-        "cpu_temp": (124, 56, 150, 132),
-        "cpu_load": (356, 56, 150, 132),
-        "gpu_temp": (124, 268, 150, 344),
-        "gpu_load": (356, 268, 150, 344),
+    # Ячейка 480x480 делится на четыре по 240: и подписи, и значения остаются
+    # внутри своей ячейки, иначе соседние виджеты затирают друг друга.
+    cells = {
+        "cpu_temp": (120, 52, 170),
+        "cpu_load": (360, 52, 170),
+        "gpu_temp": (120, 262, 380),
+        "gpu_load": (360, 262, 380),
     }
-    for key, (x, label_y, value_y, _) in positions.items():
-        widgets.append(label(f"lbl-{key.replace('_', '-')}", LABELS[key], x, label_y, 30, labels))
+    for key, (x, label_y, value_y) in cells.items():
         unit = "°C" if key.endswith("temp") else "%"
         maximum = 110 if key.endswith("temp") else 100
-        widgets.append(value(f"val-{key.replace('_', '-')}", sources[key], x, value_y, 104,
-                             values[key], unit=unit, width=240, value_max=maximum))
+        widgets.append(label(f"lbl-{key.replace('_', '-')}",
+                             LABELS[key].replace("TEMP", "TEMP " + unit).replace("LOAD", "LOAD " + unit),
+                             x, label_y, 30, labels, width=230))
+        widgets.append(value(f"val-{key.replace('_', '-')}", sources[key], x, value_y, 92,
+                             values[key], unit="", width=230, value_max=maximum))
     return "grid", "Сетка", widgets
 
 
 def theme_large(sources: dict, background, labels, values) -> tuple[str, str, list]:
     widgets = [
-        label("lbl-cpu-temp", "CPU", 128, 74, 34, labels),
-        value("val-cpu-temp", sources["cpu_temp"], 128, 190, 150, values["cpu_temp"],
-              unit="°", width=260, value_max=110),
-        label("lbl-gpu-temp", "GPU", 352, 74, 34, labels),
-        value("val-gpu-temp", sources["gpu_temp"], 352, 190, 150, values["gpu_temp"],
-              unit="°", width=260, value_max=110),
-        label("lbl-cpu-load", "CPU", 128, 330, 28, labels),
-        value("val-cpu-load", sources["cpu_load"], 128, 386, 64, values["cpu_load"],
-              unit="%", width=200),
-        label("lbl-gpu-load", "GPU", 352, 330, 28, labels),
-        value("val-gpu-load", sources["gpu_load"], 352, 386, 64, values["gpu_load"],
-              unit="%", width=200),
+        label("lbl-cpu-temp", "CPU °C", 120, 44, 32, labels, width=230),
+        value("val-cpu-temp", sources["cpu_temp"], 120, 176, 112, values["cpu_temp"],
+              unit="", width=230, value_max=110),
+        label("lbl-gpu-temp", "GPU °C", 360, 44, 32, labels, width=230),
+        value("val-gpu-temp", sources["gpu_temp"], 360, 176, 112, values["gpu_temp"],
+              unit="", width=230, value_max=110),
+        label("lbl-cpu-load", "CPU %", 120, 330, 30, labels, width=230),
+        value("val-cpu-load", sources["cpu_load"], 120, 424, 68, values["cpu_load"],
+              unit="", width=230),
+        label("lbl-gpu-load", "GPU %", 360, 330, 30, labels, width=230),
+        value("val-gpu-load", sources["gpu_load"], 360, 424, 68, values["gpu_load"],
+              unit="", width=230),
     ]
     return "large", "Крупные цифры", widgets
 
 
 def theme_bars(sources: dict, background, labels, values) -> tuple[str, str, list]:
     widgets = []
-    rows = [("cpu_temp", 70), ("cpu_load", 176), ("gpu_temp", 282), ("gpu_load", 388)]
+    rows = [("cpu_temp", 62), ("cpu_load", 172), ("gpu_temp", 282), ("gpu_load", 392)]
     for key, y in rows:
         unit = "°C" if key.endswith("temp") else "%"
         maximum = 110 if key.endswith("temp") else 100
-        widgets.append(label(f"lbl-{key.replace('_', '-')}", LABELS[key], 130, y, 30, labels, width=220))
-        widgets.append(value(f"val-{key.replace('_', '-')}", sources[key], 392, y, 52,
-                             values[key], unit=unit, width=150, value_max=maximum))
-        widgets.append(bar(f"bar-{key.replace('_', '-')}", sources[key], 240, y + 40, 400,
+        widgets.append(label(f"lbl-{key.replace('_', '-')}", f"{LABELS[key]} {unit}",
+                             120, y, 30, labels, width=220))
+        widgets.append(value(f"val-{key.replace('_', '-')}", sources[key], 392, y, 56,
+                             values[key], unit="", width=150, value_max=maximum))
+        widgets.append(bar(f"bar-{key.replace('_', '-')}", sources[key], 240, y + 50, 400,
                            values[key], background))
     return "bars", "Полосы", widgets
 
 
 def theme_gauges(sources: dict, background, labels, values) -> tuple[str, str, list]:
     widgets = [
-        gauge("gauge-cpu-temp", sources["cpu_temp"], 140, 150, 220, values["cpu_temp"],
+        gauge("gauge-cpu-temp", sources["cpu_temp"], 130, 168, 190, values["cpu_temp"],
               background, value_max=110),
-        gauge("gauge-gpu-temp", sources["gpu_temp"], 340, 150, 220, values["gpu_temp"],
+        gauge("gauge-gpu-temp", sources["gpu_temp"], 350, 168, 190, values["gpu_temp"],
               background, value_max=110),
-        label("lbl-cpu-temp", "CPU", 140, 60, 30, labels, width=160),
-        label("lbl-gpu-temp", "GPU", 340, 60, 30, labels, width=160),
-        value("val-cpu-temp", sources["cpu_temp"], 140, 150, 60, values["cpu_temp"],
-              unit="°", width=180, value_max=110),
-        value("val-gpu-temp", sources["gpu_temp"], 340, 150, 60, values["gpu_temp"],
-              unit="°", width=180, value_max=110),
-        label("lbl-cpu-load", "CPU LOAD", 140, 320, 26, labels, width=200),
-        value("val-cpu-load", sources["cpu_load"], 140, 372, 56, values["cpu_load"],
-              unit="%", width=180),
-        label("lbl-gpu-load", "GPU LOAD", 340, 320, 26, labels, width=200),
-        value("val-gpu-load", sources["gpu_load"], 340, 372, 56, values["gpu_load"],
-              unit="%", width=180),
+        label("lbl-cpu-temp", "CPU °C", 130, 40, 30, labels, width=180),
+        label("lbl-gpu-temp", "GPU °C", 350, 40, 30, labels, width=180),
+        value("val-cpu-temp", sources["cpu_temp"], 130, 168, 52, values["cpu_temp"],
+              unit="", width=140, value_max=110),
+        value("val-gpu-temp", sources["gpu_temp"], 350, 168, 52, values["gpu_temp"],
+              unit="", width=140, value_max=110),
+        label("lbl-cpu-load", "CPU LOAD %", 130, 306, 26, labels, width=220),
+        value("val-cpu-load", sources["cpu_load"], 130, 392, 56, values["cpu_load"],
+              unit="", width=200),
+        label("lbl-gpu-load", "GPU LOAD %", 350, 306, 26, labels, width=220),
+        value("val-gpu-load", sources["gpu_load"], 350, 392, 56, values["gpu_load"],
+              unit="", width=200),
     ]
     return "gauges", "Приборы", widgets
 
@@ -304,6 +323,56 @@ def build(palette_path: str, current_path: str | None) -> tuple[list, dict]:
     return templates, report
 
 
+PLACEHOLDER = None
+
+
+def check(templates: list) -> list:
+    """Проверяет макет до отправки на экран.
+
+    Рамка виджета — это и область, которую дисплей затирает перед новой
+    отрисовкой. Поэтому важны две вещи: текст должен в неё помещаться (иначе
+    остаются прежние символы, и цифры накладываются друг на друга), и рамки не
+    должны пересекаться между собой.
+    """
+    problems = []
+    for template in templates:
+        boxes = []
+        for widget in template["widgets"]:
+            kind = widget["kind"]
+            x, y = widget["x"], widget["y"]
+            width, height = widget["width"], widget["height"]
+            boxes.append((widget["id"], x - width / 2, y - height / 2, x + width / 2, y + height / 2))
+            size = kind.get("font_size", 0)
+            if kind["type"] == "label":
+                needed = len(kind.get("text", "")) * size * 0.62
+            elif kind["type"] == "value_text":
+                needed = 3 * size * 0.62
+            else:
+                needed = 0
+            if needed and needed > width:
+                problems.append(
+                    f"{template['id']}: текст {widget['id']} шире рамки "
+                    f"({needed:.0f} > {width:.0f})")
+        kinds = {widget["id"]: widget["kind"]["type"] for widget in template["widgets"]}
+
+        def allowed_overlap(first_id: str, second_id: str) -> bool:
+            # Число внутри круглой шкалы — задуманная композиция: кольцо рисуется
+            # по краю, середина остаётся под значение.
+            pair = {kinds.get(first_id), kinds.get(second_id)}
+            return pair == {"radial_gauge", "value_text"}
+
+        for index, first in enumerate(boxes):
+            if first[1] < 0 or first[2] < 0 or first[3] > SIZE or first[4] > SIZE:
+                problems.append(f"{template['id']}: {first[0]} выходит за экран")
+            for second in boxes[index + 1:]:
+                if allowed_overlap(first[0], second[0]):
+                    continue
+                if (first[1] < second[3] and second[1] < first[3]
+                        and first[2] < second[4] and second[2] < first[4]):
+                    problems.append(f"{template['id']}: {first[0]} и {second[0]} перекрываются")
+    return problems
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--palette", default=os.path.expanduser(
@@ -313,6 +382,7 @@ def main() -> int:
     parser.add_argument("--theme")
     parser.add_argument("--list", action="store_true")
     parser.add_argument("--report", action="store_true")
+    parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
 
     if args.list:
@@ -324,6 +394,12 @@ def main() -> int:
         return 0
 
     templates, report = build(args.palette, args.current)
+    if args.check:
+        problems = check(templates)
+        for problem in problems:
+            print(problem)
+        print(f"проверено {len(templates)} тем, замечаний {len(problems)}")
+        return 1 if problems else 0
     if args.report:
         print(json.dumps(report, ensure_ascii=False))
     if args.write:

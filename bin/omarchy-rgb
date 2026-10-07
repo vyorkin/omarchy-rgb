@@ -781,6 +781,11 @@ cmd_lcdtheme() {
     if [[ $current == "$theme" && ${OMARCHY_RGB_FORCE:-0} != 1 ]]; then
         return 0
     fi
+    # Сначала проверка макета: рамка виджета — это и область, которую экран
+    # затирает, поэтому текст шире рамки оставляет прежние цифры, и они
+    # накладываются друг на друга. Битый макет на экран не отправляем.
+    check=$(python3 "$LCD_THEMES" --palette "$OMARCHY_COLORS" --current "$LCD_TEMPLATES" \
+        --check 2>&1) || die "макет темы экрана не прошёл проверку: $check"
     python3 "$LCD_THEMES" --palette "$OMARCHY_COLORS" --current "$LCD_TEMPLATES" \
         --write "$LCD_TEMPLATES" >/dev/null 2>&1 \
         || die "не удалось собрать темы экрана из палитры $OMARCHY_COLORS"
