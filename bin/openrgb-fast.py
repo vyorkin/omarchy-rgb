@@ -233,12 +233,59 @@ def discover(names: list[str]) -> int:
     return 0
 
 
+GAINS_PATH = os.path.expanduser(
+    os.path.join(os.environ.get("XDG_STATE_HOME", "~/.local/state"), "omarchy-rgb", "board-gains")
+)
+
+
+def board_curve() -> list[tuple[float, float]]:
+    """Кривая отдачи каналов у цепочки на разъёмах платы.
+
+    Одна и та же пара значений на контроллере Lian Li и на разъёмах платы
+    светит по-разному: у платы зелёный зажигается заметно позже остальных
+    каналов. На полной яркости разницы нет, а на слабых уровнях зелёного
+    не хватает и нейтральный серый выглядит розовым. Поэтому для каждого
+    канала задаётся пара "множитель и показатель степени": выход =
+    множитель * 255 * (вход / 255) ** показатель. Показатель меньше единицы
+    поднимает слабые уровни, не трогая верх.
+
+    Файл: board-gains в каталоге состояния, шесть чисел
+    "множительR показательR множительG показательG множительB показательB",
+    по умолчанию "1 1 1 1 1 1".
+    """
+    default = [(1.0, 1.0), (1.0, 1.0), (1.0, 1.0)]
+    try:
+        with open(GAINS_PATH, encoding="utf-8") as handle:
+            parts = [float(part) for part in handle.read().split()]
+    except (OSError, ValueError):
+        return default
+    if len(parts) == 3:
+        # Старый формат: только множители.
+        return [(max(0.0, min(1.0, part)), 1.0) for part in parts]
+    if len(parts) >= 6:
+        return [
+            (max(0.0, min(2.0, parts[index])), max(0.05, min(4.0, parts[index + 1])))
+            for index in (0, 2, 4)
+        ]
+    return default
+
+
+def calibrated(color: int) -> int:
+    curve = board_curve()
+    channels = [(color >> 16) & 0xFF, (color >> 8) & 0xFF, color & 0xFF]
+    out = []
+    for value, (gain, gamma) in zip(channels, curve):
+        shaped = 255.0 * (value / 255.0) ** gamma
+        out.append(max(0, min(255, round(shaped * gain))))
+    return (out[0] << 16) | (out[1] << 8) | out[2]
+
+
 def scaled_color(accent: str, percent: int) -> int:
     accent = accent.lstrip("#")
     scale = max(0, min(100, percent)) / 100.0
     channels = [round(int(accent[i : i + 2], 16) * scale) for i in (0, 2, 4)]
     channels = [max(0, min(255, value)) for value in channels]
-    return (channels[0] << 16) | (channels[1] << 8) | channels[2]
+    return calibrated((channels[0] << 16) | (channels[1] << 8) | channels[2])
 
 
 def resolve(names: list[str], sock: socket.socket) -> dict:
@@ -264,6 +311,31 @@ def resolve(names: list[str], sock: socket.socket) -> dict:
         discover(names)
         cache = read_cache()
     return cache
+
+
+def set_mode(percent: int, accent: str, names: list[str], port: int = 6742) -> int:
+    """Задаёт цвет режимом, через уже поднятый сервер OpenRGB.
+
+    Единственный путь записи для платы: железо хранит цвет режима отдельно от
+    массива светодиодов, и если писать двумя путями, оно показывает то, что
+    записано последним. Плюс клиентский режим не пересканирует машину заново,
+    поэтому запись занимаетсекунду вместо трёх.
+    """
+    if not server_running():
+        return 3
+    color = scaled_color(accent, percent)
+    if percent <= 0:
+        mode, color = "Off", None
+    else:
+        mode = "Static"
+    for name in names:
+        command = ["openrgb", "--client", f"127.0.0.1:{port}", "-d", name, "-m", mode]
+        if color is not None:
+            command += ["-c", f"{color:06x}"]
+        result = subprocess.run(command, capture_output=True, timeout=60)
+        if result.returncode != 0:
+            return 1
+    return 0
 
 
 def apply(percent: int, accent: str, names: list[str]) -> int:
@@ -343,6 +415,12 @@ def verify(percent: int, accent: str, names: list[str], verbose: bool = False) -
 
 
 def main(argv: list[str]) -> int:
+    if len(argv) == 3 and argv[1] == "gains":
+        curve = board_curve()
+        sc = scaled_color(f"#{argv[2].lstrip('#')}", 100)
+        described = " ".join(f"{channel}: x{gain} ^ {gamma}" for channel, (gain, gamma) in zip("RGB", curve))
+        print(f"кривая {described} -> #{(sc >> 16) & 0xFF:02x}{(sc >> 8) & 0xFF:02x}{sc & 0xFF:02x}")
+        return 0
     if len(argv) < 2:
         print(__doc__.strip().splitlines()[-1])
         return 2
@@ -362,6 +440,10 @@ def main(argv: list[str]) -> int:
         if len(argv) < 5:
             return 2
         return verify(int(float(argv[2])), argv[3], argv[4:])
+    if action == "mode":
+        if len(argv) < 5:
+            return 2
+        return set_mode(int(float(argv[2])), argv[3], argv[4:])
     if action == "apply":
         if len(argv) < 5:
             return 2

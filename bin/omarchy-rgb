@@ -431,11 +431,14 @@ PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OPENRGB_HELPER="$PLUGIN_DIR/bin/openrgb-fast.py"
 OPENRGB_CACHE="$STATE_DIR/openrgb-devices.json"
 
+# Цвет платы задаётся цветом режима — тем же способом, что и в хуке темы.
+# Массив светодиодов напрямую (действие apply у хелпера) больше не используется:
+# железо хранит цвет режима отдельно, и два писателя давали разные оттенки.
 openrgb_fast() {
     local percent=$1
     [[ -x $OPENRGB_HELPER ]] || return 1
     command -v python3 >/dev/null 2>&1 || return 1
-    "$OPENRGB_HELPER" apply "$percent" "$(accent_hex)" "${OPENRGB_DEVICES[@]}" 2>/dev/null
+    "$OPENRGB_HELPER" mode "$percent" "$(accent_hex)" "${OPENRGB_DEVICES[@]}" 2>/dev/null
 }
 
 # Сервер ещё не поднят — поднимаем его в фоне, чтобы следующее движение
@@ -515,7 +518,16 @@ openrgb_async() {
         applied=$(state_get openrgb_applied)
         [[ -n $current && $current == "$applied" ]] && exit 0
 
-        openrgb_apply_state
+        # Запись идёт через уже поднятый сервер: доли секунды вместо трёх
+        # секунд полного сканирования. Если сервера нет, поднимаем его и
+        # красим обычным путём — это медленно, но происходит в фоне.
+        local level
+        level=$(state_get brightness)
+        [[ $(state_get on) == false ]] && level=0
+        if ! openrgb_fast "$level"; then
+            openrgb_warmup
+            openrgb_render "$level"
+        fi
         state_mark_applied "$current"
     ) 9>>"$OPENRGB_LOCK" &
 }
@@ -585,12 +597,11 @@ apply_all() {
         state_mark_fast "$fast"
     fi
 
-    # Плата: одна команда, когда сервер уже поднят. Если его нет — фоновый опрос
-    # CLI плюс подъём сервера для следующих движений ползунка.
-    if ! openrgb_fast "$percent"; then
-        openrgb_warmup
-        openrgb_async "$generation"
-    fi
+    # Плата красится в фоне: одна запись на всё перетаскивание ползунка. Раньше
+    # здесь стоял синхронный вызов, и после перехода на запись цветом режима он
+    # стал держать интерфейс около двух секунд.
+    openrgb_warmup
+    openrgb_async "$generation"
     return 0
 }
 
