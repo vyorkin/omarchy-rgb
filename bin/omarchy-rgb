@@ -438,9 +438,6 @@ openrgb_fast() {
     local percent=$1
     [[ -x $OPENRGB_HELPER ]] || return 1
     command -v python3 >/dev/null 2>&1 || return 1
-    # Единственный путь записи платы — командная строка: только он даёт верный
-    # цвет (проверено на железе). Своя сборка пакетов в хелпере есть, но она
-    # ОТКЛЮЧЕНА: с ней цвета расходились, и возвращать её без нужды не нужно.
     "$OPENRGB_HELPER" mode "$percent" "$(accent_hex)" "${OPENRGB_DEVICES[@]}" 2>/dev/null
 }
 
