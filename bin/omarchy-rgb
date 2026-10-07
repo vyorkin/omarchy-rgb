@@ -1,0 +1,325 @@
+#!/usr/bin/env bash
+# omarchy-rgb — one knob for every light this machine exposes.
+#
+# Targets, in the order they are touched:
+#   1. OpenRGB devices (motherboard ARGB headers, graphics card) — CLI, -b percent;
+#   2. Lian Li devices (AIO pump and fans, wireless strips and fans) — the
+#      daemon's Unix-socket IPC (newline-delimited JSON), which applies effects
+#      instantly and needs no daemon restart;
+#   3. the AIO screen's backlight — the same IPC, SetLcdBrightness;
+#   4. the 8.8" case panel — `bezel brightness`.
+#
+# RAM modules are deliberately out of scope: their RGB sits behind the ENE
+# SMBus controller, and writing to it has a history of damaging DDR5 modules.
+#
+# Commands:
+#   omarchy-rgb status [--json]   print the current state
+#   omarchy-rgb set <0..100>      set every light to a percentage
+#   omarchy-rgb on                restore the last non-zero brightness
+#   omarchy-rgb off               turn everything off, remembering the level
+#   omarchy-rgb toggle            off when anything is on, on otherwise
+#
+# State lives in ${XDG_STATE_HOME:-~/.local/state}/omarchy-rgb/state.json.
+
+set -uo pipefail
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-rgb"
+STATE_FILE="$STATE_DIR/state.json"
+LIANLI_SOCKET="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/lianli-daemon.sock"
+OMARCHY_COLORS="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/current/theme/colors.toml"
+
+# Devices by name as OpenRGB reports them. Add or remove lines to taste; the
+# widget never touches anything not listed here.
+OPENRGB_DEVICES=(
+    "ASRock X870 Pro RS WiFi"
+    "MSI GeForce RTX 5080 Gaming Trio OC"
+)
+
+# Lian Li devices are not listed by hand: they come from the daemon's config, so
+# strips that appear later are picked up on their own.
+AIO_LCD_DEVICE="hid:0416:7395:8-12"
+
+die() { printf 'omarchy-rgb: %s\n' "$*" >&2; exit 1; }
+log() { printf 'omarchy-rgb: %s\n' "$*" >&2; }
+
+# --- theme accent -------------------------------------------------------------
+
+accent_hex() {
+    local accent
+    accent=$(omarchy-theme-color --file "$OMARCHY_COLORS" accent 2>/dev/null | tr -d '"' || true)
+    [[ $accent =~ ^#[0-9a-fA-F]{6}$ ]] || accent="#ffffff"
+    printf '%s' "$accent"
+}
+
+# --- state --------------------------------------------------------------------
+
+state_read() {
+    if [[ -r $STATE_FILE ]]; then
+        cat "$STATE_FILE"
+    else
+        printf '{"on":true,"brightness":100}'
+    fi
+}
+
+state_write() {
+    local on=$1 brightness=$2
+    mkdir -p "$STATE_DIR"
+    printf '{"on":%s,"brightness":%s}\n' "$on" "$brightness" >"$STATE_FILE.tmp"
+    mv "$STATE_FILE.tmp" "$STATE_FILE"
+}
+
+# --- Lian Li IPC --------------------------------------------------------------
+
+# Everything Lian Li goes through the daemon's Unix socket: newline-delimited
+# JSON, one response per request. Writes must carry a WriteGuard — the daemon
+# refuses anonymous changes — so the helper asks for DaemonInfo first and wraps
+# every write. Reading the guard needs no privileges: it only pins the daemon
+# version and instance id.
+lianli_available() {
+    [[ -S $LIANLI_SOCKET ]] && command -v python3 >/dev/null 2>&1
+}
+
+# Percent to the five levels the Lian Li firmware understands.
+level_for_percent() {
+    local percent=$1
+    if (( percent <= 0 )); then
+        echo 0
+    else
+        local level=$(( (percent * 4 + 99) / 100 ))
+        (( level < 1 )) && level=1
+        (( level > 4 )) && level=4
+        echo "$level"
+    fi
+}
+
+# lianli_send zones <level> <disabled> | lianli_send lcd <percent> false <device>
+lianli_send() {
+    local action=${1:-zones}
+    lianli_available || return 1
+    python3 - "$LIANLI_SOCKET" "$action" "${2:-0}" "${3:-false}" "${4:-}" <<'INNER'
+import json
+import socket
+import sys
+
+socket_path, action, amount, flag, device = sys.argv[1:6]
+disabled = flag == "true"
+
+
+def call(request):
+    """One request, one response line."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+            sock.settimeout(6)
+            sock.connect(socket_path)
+            sock.sendall(json.dumps(request).encode() + b"\n")
+            buf = b""
+            while b"\n" not in buf:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+    except OSError as error:
+        return {"status": "error", "message": str(error)}
+    try:
+        return json.loads(buf.decode(errors="replace"))
+    except ValueError:
+        return {"status": "error", "message": "unreadable response"}
+
+
+info = call({"method": "GetDaemonInfo"})
+if info.get("status") != "ok":
+    print(info.get("message", "daemon did not answer"))
+    sys.exit(0)
+daemon = info["data"]
+# Claiming the daemon's own version is what the GUI does too: the guard exists to
+# make sure both sides agree, not to authenticate a particular program.
+guard = {
+    "client_version": daemon.get("version"),
+    "protocol_version": daemon.get("protocol_version"),
+    "instance_id": daemon.get("instance_id"),
+}
+
+
+def write(request):
+    response = call({"method": "Guarded", "params": {"guard": guard, "request": request}})
+    if response.get("status") != "ok":
+        print(response.get("message", "write rejected"))
+    return response
+
+
+if action == "lcd":
+    write({
+        "method": "SetLcdBrightness",
+        "params": {"device_id": device, "brightness": int(amount)},
+    })
+    sys.exit(0)
+
+config = call({"method": "GetConfig"})
+if config.get("status") != "ok":
+    print(config.get("message", "cannot read the daemon config"))
+    sys.exit(0)
+
+rgb = (config["data"].get("rgb") or None)
+if not rgb or not rgb.get("devices"):
+    print("no RGB devices in the daemon config")
+    sys.exit(0)
+
+for device_entry in rgb.get("devices", []):
+    for zone in device_entry.get("zones", []):
+        # Mode, colours and speed stay exactly as the theme sync left them: the
+        # widget only scales what is already there. The whole RGB config goes back
+        # in one SetRgbConfig call, which is the path the Lian Li GUI itself uses:
+        # it expands per-device scopes and regions correctly, while a raw
+        # SetRgbEffect would be rejected for devices like the Strimer whose
+        # effects are only valid in their own scope.
+        effect = dict(zone.get("effect") or {})
+        effect["brightness"] = int(amount)
+        effect["disabled"] = disabled
+        zone["effect"] = effect
+
+write({"method": "SetRgbConfig", "params": {"config": rgb}})
+INNER
+}
+
+lianli_apply() {
+    local percent=$1 level
+    level=$(level_for_percent "$percent")
+    local out
+    out=$(lianli_send zones "$level" "$([[ $percent -le 0 ]] && echo true || echo false)")
+    [[ -n $out ]] && log "Lian Li: $(printf '%s' "$out" | head -c 200)"
+    return 0
+}
+
+lianli_lcd_brightness() {
+    local percent=$1 out
+    [[ -S $LIANLI_SOCKET ]] || return 0
+    out=$(lianli_send lcd "$percent" false "$AIO_LCD_DEVICE")
+    [[ -n $out ]] && log "Lian Li LCD: $(printf '%s' "$out" | head -c 200)"
+    return 0
+}
+
+# --- OpenRGB ------------------------------------------------------------------
+
+openrgb_apply() {
+    local percent=$1
+    command -v openrgb >/dev/null 2>&1 || return 0
+
+    local accent device
+    accent=$(accent_hex)
+    for device in "${OPENRGB_DEVICES[@]}"; do
+        if (( percent <= 0 )); then
+            # Off, rather than brightness 0: some ASRock modes ignore brightness
+            # and would keep glowing.
+            timeout 60 openrgb --noautoconnect -d "$device" -m Off >/dev/null 2>&1 \
+                || log "OpenRGB: не удалось выключить '$device'"
+        else
+            timeout 60 openrgb --noautoconnect -d "$device" -m Static -c "${accent#\#}" -b "$percent" \
+                >/dev/null 2>&1 \
+                || log "OpenRGB: не удалось применить яркость к '$device'"
+        fi
+    done
+}
+
+# --- 8.8" panel ---------------------------------------------------------------
+
+bezel_apply() {
+    local percent=$1
+    command -v bezel >/dev/null 2>&1 || return 0
+    timeout 30 bezel brightness "$percent" >/dev/null 2>&1 || true
+}
+
+# --- commands -----------------------------------------------------------------
+
+apply_all() {
+    local percent=$1
+    openrgb_apply "$percent"
+    lianli_apply "$percent" || true
+    lianli_lcd_brightness "$percent" || true
+    bezel_apply "$percent"
+    return 0
+}
+
+read_state_field() {
+    python3 - "$(state_read)" "$1" <<'PY'
+import json
+import sys
+
+try:
+    state = json.loads(sys.argv[1])
+except ValueError:
+    state = {}
+value = state.get(sys.argv[2])
+if isinstance(value, bool):
+    print("true" if value else "false")
+elif value is None:
+    print("")
+else:
+    print(value)
+PY
+}
+
+cmd_status() {
+    local json=0
+    [[ ${1:-} == --json ]] && json=1
+    local on brightness accent
+    on=$(read_state_field on)
+    brightness=$(read_state_field brightness)
+    [[ -n $on ]] || on=true
+    [[ -n $brightness ]] || brightness=100
+    accent=$(accent_hex)
+    if (( json )); then
+        printf '{"on":%s,"brightness":%s,"accent":"%s"}\n' "$on" "$brightness" "$accent"
+    else
+        if [[ $on == true ]]; then
+            printf 'lights on, %s%%, accent %s\n' "$brightness" "$accent"
+        else
+            printf 'lights off (last level %s%%)\n' "$brightness"
+        fi
+    fi
+}
+
+cmd_set() {
+    local percent=${1:-}
+    [[ $percent =~ ^[0-9]+$ ]] || die "яркость должна быть целым числом 0..100"
+    (( percent >= 0 && percent <= 100 )) || die "яркость должна быть 0..100"
+
+    apply_all "$percent"
+    if (( percent <= 0 )); then
+        # Off keeps the previous level, so `on` has something to restore.
+        local last
+        last=$(read_state_field brightness)
+        [[ -n $last && $last != 0 ]] || last=100
+        state_write false "$last"
+    else
+        state_write true "$percent"
+    fi
+}
+
+cmd_on() {
+    local last
+    last=$(read_state_field brightness)
+    [[ -n $last && $last != 0 ]] || last=100
+    cmd_set "$last"
+}
+
+cmd_off() { cmd_set 0; }
+
+cmd_toggle() {
+    local on
+    on=$(read_state_field on)
+    [[ -n $on ]] || on=true
+    if [[ $on == true ]]; then cmd_off; else cmd_on; fi
+}
+
+case "${1:-status}" in
+    status) shift || true; cmd_status "${1:-}" ;;
+    set) shift || true; cmd_set "${1:-}" ;;
+    on) cmd_on ;;
+    off) cmd_off ;;
+    toggle) cmd_toggle ;;
+    accent) accent_hex ;;
+    -h|--help|help)
+        sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+        ;;
+    *) die "неизвестная команда '${1}'" ;;
+esac
