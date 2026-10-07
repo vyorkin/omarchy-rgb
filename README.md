@@ -84,7 +84,17 @@ State lives in `${XDG_STATE_HOME:-~/.local/state}/omarchy-rgb/state.json`, so
 `openrgb` re-detects the whole machine on every run — about three seconds per
 device — which is far too slow to sit behind a slider. Two paths fix that:
 
-- **The board.** `bin/openrgb-fast.py` speaks the OpenRGB SDK protocol straight
+- **The board.** The helper sends the same two packets as the command line -
+  `UPDATEMODE` with `color_mode = 0` and one black colour, then `UPDATELEDS` with
+  the real one - straight to a background `openrgb --server`. That order and that
+  `color_mode` are what make the driver take its colour from the LED array; a
+  reversed order or the `color_mode` from the device description paints the old
+  colour. The run was checked packet by packet against `openrgb` through a
+  logging proxy, so the two are byte-for-byte equal, and the helper is ~60 times
+  faster because it does not re-detect the machine. The command line remains the
+  fallback.
+
+Deprecated note: the board.
   to a background `openrgb --server`: the colour goes into the LED array and the
   mode is re-applied, which is the same thing `openrgb -m Static -c ...` does,
   in about 17 ms instead of a second of re-detecting the machine. The command

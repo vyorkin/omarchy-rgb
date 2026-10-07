@@ -50,6 +50,13 @@ CACHE_PATH = os.path.join(STATE_DIR, "openrgb-devices.json")
 SERVER_LOG = os.path.join(STATE_DIR, "openrgb-server.log")
 
 
+def server_port() -> int:
+    try:
+        return int(os.environ.get("OMARCHY_RGB_OPENRGB_PORT", "6742"))
+    except ValueError:
+        return 6742
+
+
 def connect(timeout: float = 3.0) -> socket.socket | None:
     try:
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -427,11 +434,28 @@ def set_mode_fast(percent: int, accent: str, name: str, port: int = 6742) -> int
         if target is None:
             return 3
         color = scaled_color(accent, percent)
-        update_leds(sock, index, entry["leds"], color)
-        record = dict(modes[target])
-        record["colors"] = []
+        # Порядок и содержимое как у 'openrgb -m Static -c ...': сначала режим,
+        # причём с color_mode = 0 и одним чёрным цветом — это значит "применить
+        # режим, свои цвета не задавать". Только после этого массив светодиодов,
+        # из которого драйвер ASRock и берёт цвет. Обратный порядок заставлял
+        # устройство рисовать старый цвет, а color_mode = 1 из описания — ждать
+        # цвета внутри записи режима.
+        record = {
+            "name": modes[target]["name"],
+            "value": modes[target]["value"],
+            "flags": modes[target]["flags"],
+            "speed_min": modes[target]["speed_min"],
+            "speed_max": modes[target]["speed_max"],
+            "colors_min": modes[target]["colors_min"],
+            "colors_max": modes[target]["colors_max"],
+            "speed": modes[target]["speed"],
+            "brightness": 0,
+            "color_mode": 0,
+            "colors": [0],
+        }
         payload = struct.pack("<II", 8 + len(pack_mode(record)), target) + pack_mode(record)
         send(sock, index, PACKET_UPDATE_MODE, payload)
+        update_leds(sock, index, entry["leds"], color)
         return 0
     finally:
         sock.close()
