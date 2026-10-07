@@ -243,6 +243,29 @@ its next save; `SetConfig` updates that copy but does not touch the screen, so o
 own it changes nothing you can see. Sending the pair is what makes the slider both
 visible and permanent. The 8.8" case panel still follows the lighting slider.
 
+### Screen themes
+
+The cooler's 480x480 screen has four layouts, built by `bin/lcd_themes.py` from the
+palette of the active theme:
+
+| id | what it is |
+|---|---|
+| `grid` | four values in a 2x2 grid with labels above |
+| `large` | two temperatures very large, the two loads below |
+| `bars` | four rows, each with a label, a value and a bar |
+| `gauges` | two round gauges for the temperatures, the loads underneath |
+
+Pick one with `omarchy-rgb lcdtheme <id>` or from the buttons in the popup; the
+choice is kept in the plugin's state, and the theme hook rebuilds the colours from
+the new palette while leaving your layout alone.
+
+Every text colour is checked against the background and lightened until it clears a
+contrast of 7:1 for values and 5:1 for labels (WCAG, the same measure browsers use).
+That check exists because it caught a real case: a palette painted all four values
+the same colour, one of them dark red on near-black at a contrast of 1.7 - the
+numbers were effectively invisible. Values are also pushed apart from each other if
+the palette collapses them into one colour.
+
 ## Configure
 
 Device names for OpenRGB and the AIO's device ID are listed at the top of

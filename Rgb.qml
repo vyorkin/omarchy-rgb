@@ -25,6 +25,7 @@ Panel {
   property bool lightsOn: true
   property int brightness: 100
   property int screenBrightness: 100
+  property string lcdTheme: "grid"
   property bool busy: false
   property string errorText: ""
 
@@ -67,6 +68,7 @@ Panel {
           root.lightsOn = state.on === true
           root.brightness = Number(state.brightness)
           root.screenBrightness = state.lcd === undefined ? 100 : Number(state.lcd)
+          root.lcdTheme = state.lcdTheme === undefined ? "grid" : String(state.lcdTheme)
           root.errorText = ""
         } catch (error) {
           root.errorText = "cannot read state"
@@ -133,6 +135,21 @@ Panel {
     percent = Math.max(0, Math.min(100, Math.round(percent)))
     if (!live) screenBrightness = percent
     run([root.cli, "lcd", String(percent)])
+  }
+
+  // Layouts for the cooler's screen: these are the ids build by bin/lcd_themes.py,
+  // which rebuilds them from the palette of whatever theme is active.
+  readonly property var lcdThemes: [
+    { id: "grid", label: "Сетка" },
+    { id: "large", label: "Крупно" },
+    { id: "bars", label: "Полосы" },
+    { id: "gauges", label: "Приборы" }
+  ]
+
+  function pushTheme(id) {
+    if (!id || id === lcdTheme) return
+    lcdTheme = id
+    run([root.cli, "lcdtheme", id], function() { refresh() })
   }
 
   function refresh() {
@@ -306,6 +323,26 @@ Panel {
             font.family: Style.font.family
             font.pixelSize: Style.font.bodySmall
             textFormat: Text.PlainText
+          }
+        }
+
+        PanelSeparator { foreground: root.textColor }
+
+        Row {
+          id: themeRow
+          width: parent.width
+          spacing: Style.spacing.controlGap
+
+          Repeater {
+            model: root.lcdThemes
+
+            Button {
+              text: modelData.label
+              selected: root.lcdTheme === modelData.id
+              hasCursor: true
+              foreground: root.textColor
+              onClicked: root.pushTheme(modelData.id)
+            }
           }
         }
 

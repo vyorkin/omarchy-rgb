@@ -62,7 +62,7 @@ STATE_FILE="$STATE_DIR/state.json"
 LIANLI_COLORS="$STATE_DIR/lianli-colors.json"
 GUARD_CACHE="$STATE_DIR/lianli-guard.json"
 
-state_default() { printf '{"on":true,"brightness":100,"generation":0,"fast_percent":-1,"lcd_brightness":100}'; }
+state_default() { printf '{"on":true,"brightness":100,"generation":0,"fast_percent":-1,"lcd_brightness":100,"lcd_theme":"grid"}'; }
 
 state_read() {
     if [[ -r $STATE_FILE ]]; then cat "$STATE_FILE"; else state_default; fi
@@ -129,21 +129,21 @@ lianli_available() {
 }
 
 # lianli_apply <percent>
-# lianli_apply <процент подсветки|пусто> [процент яркости экрана] [только экран]
+# lianli_apply <процент подсветки|пусто> [процент яркости экрана] [только экран] [тема экрана]
 lianli_apply() {
-    local percent=${1:-0} lcd_percent=${2:-} skip_rgb=${3:-0} out
+    local percent=${1:-0} lcd_percent=${2:-} skip_rgb=${3:-0} lcd_theme=${4:-} out
     lianli_available || return 0
     [[ $percent =~ ^[0-9]+$ ]] || percent=0
     out=$(python3 - "$LIANLI_SOCKET" "$LIANLI_COLORS" "$percent" "$(accent_hex)" \
         "$GUARD_CACHE" "$AIO_LCD_DEVICE" "${XDG_CONFIG_HOME:-$HOME/.config}/lianli/config.json" \
-        "$lcd_percent" "$skip_rgb" <<'INNER'
+        "$lcd_percent" "$skip_rgb" "$lcd_theme" <<'INNER'
 import json
 import os
 import socket
 import sys
 
 socket_path, colors_path, percent_raw, accent, guard_cache, lcd_device, config_path = sys.argv[1:8]
-lcd_raw, skip_rgb = sys.argv[8], sys.argv[9] == "1"
+lcd_raw, skip_rgb, theme_id = sys.argv[8], sys.argv[9] == "1", sys.argv[10].strip()
 percent = max(0, min(100, int(float(percent_raw))))
 lcd_percent = max(0, min(100, int(float(lcd_raw)))) if lcd_raw.strip() else None
 accent = accent.lstrip("#")
@@ -300,20 +300,35 @@ if not skip_rgb and rgb and rgb.get("devices"):
 # через SetLcdBrightness: только он меняет и память демона. С SetLcdBrightness
 # экран гас и загорался, но память оставалась прежней, и демон возвращал своё
 # значение при первой же своей записи — из-за этого яркость «не держалась».
-if lcd_percent is not None:
-    # Нужны оба вызова, и это не перестраховка: SetLcdBrightness меняет сам экран
-    # (демон подтверждает applied), но не трогает свою копию настроек, а SetConfig
-    # обновляет копию, не трогая экран. По отдельности получается либо живая
-    # яркость, которая откатывается при следующей записи демона, либо запись без
-    # видимого эффекта.
-    write(guarded({
-        "method": "SetLcdBrightness",
-        "params": {"device_id": lcd_device, "brightness": lcd_percent},
-    }))
+if lcd_percent is not None or theme_id:
+    # Настройки экрана живут одной записью: и яркость, и выбранная тема. Нужны
+    # оба вызова IPC, и это не перестраховка — SetLcdBrightness меняет сам экран,
+    # но не трогает копию настроек в демоне, а SetConfig обновляет копию, не
+    # трогая экран. По отдельности выходит либо живая яркость, которая
+    # откатывается, либо запись без видимого эффекта.
+    if theme_id:
+        templates_path = os.path.join(os.path.dirname(config_path), "lcd_templates.json")
+        try:
+            with open(templates_path, encoding="utf-8") as handle:
+                templates = json.load(handle).get("templates") or []
+        except (OSError, ValueError):
+            templates = []
+        if templates:
+            write(guarded({"method": "SetLcdTemplates", "params": {"templates": templates}}))
+
+    if lcd_percent is not None:
+        write(guarded({
+            "method": "SetLcdBrightness",
+            "params": {"device_id": lcd_device, "brightness": lcd_percent},
+        }))
+
     whole = dict(config.get("data") or {})
     whole["lcds"] = [dict(entry) for entry in whole.get("lcds") or []]
     for entry in whole["lcds"]:
-        entry["brightness"] = lcd_percent
+        if lcd_percent is not None:
+            entry["brightness"] = lcd_percent
+        if theme_id:
+            entry["template_id"] = theme_id
     write(guarded({"method": "SetConfig", "params": {"config": whole}}))
 
 connection.close()
@@ -656,19 +671,21 @@ PY
 cmd_status() {
     local json=0
     [[ ${1:-} == --json ]] && json=1
-    local on brightness accent lcd
+    local on brightness accent lcd theme
     on=$(state_get on)
     brightness=$(state_get brightness)
     lcd=$(state_get lcd_brightness)
+    theme=$(state_get lcd_theme)
+    [[ -n $theme ]] || theme=grid
     [[ -n $on ]] || on=true
     [[ -n $brightness ]] || brightness=100
     [[ -n $lcd ]] || lcd=100
     accent=$(accent_hex)
     if (( json )); then
-        printf '{"on":%s,"brightness":%s,"lcd":%s,"accent":"%s"}\n' "$on" "$brightness" "$lcd" "$accent"
+        printf '{"on":%s,"brightness":%s,"lcd":%s,"lcdTheme":"%s","accent":"%s"}\n' "$on" "$brightness" "$lcd" "$theme" "$accent"
     else
         if [[ $on == true ]]; then
-            printf 'lights on, %s%%, screen %s%%, accent %s\n' "$brightness" "$lcd" "$accent"
+            printf 'lights on, %s%%, screen %s%% (%s), accent %s\n' "$brightness" "$lcd" "$theme" "$accent"
         else
             printf 'lights off (last level %s%%, screen %s%%)\n' "$brightness" "$lcd"
         fi
@@ -742,6 +759,36 @@ cmd_lcd() {
     return 0
 }
 
+# Темы экрана водянки: их собирает bin/lcd_themes.py по палитре текущей темы и
+# с проверкой контраста надписей к фону.
+LCD_THEMES="$PLUGIN_DIR/bin/lcd_themes.py"
+LCD_TEMPLATES="${XDG_CONFIG_HOME:-$HOME/.config}/lianli/lcd_templates.json"
+
+cmd_lcdthemes() {
+    python3 "$LCD_THEMES" --list 2>/dev/null | while IFS=$'\t' read -r id name; do
+        current=$(state_get lcd_theme)
+        [[ $id == "$current" ]] && mark=" *" || mark=""
+        printf '%-8s %s%s\n' "$id" "$name" "$mark"
+    done
+}
+
+cmd_lcdtheme() {
+    local theme=${1:-} current
+    [[ -n $theme ]] || { cmd_lcdthemes; return 0; }
+    python3 "$LCD_THEMES" --list 2>/dev/null | cut -f1 | grep -qx "$theme" \
+        || die "неизвестная тема '$theme'; доступны: $(python3 "$LCD_THEMES" --list 2>/dev/null | cut -f1 | tr '\n' ' ')"
+    current=$(state_get lcd_theme)
+    if [[ $current == "$theme" && ${OMARCHY_RGB_FORCE:-0} != 1 ]]; then
+        return 0
+    fi
+    python3 "$LCD_THEMES" --palette "$OMARCHY_COLORS" --current "$LCD_TEMPLATES" \
+        --write "$LCD_TEMPLATES" >/dev/null 2>&1 \
+        || die "не удалось собрать темы экрана из палитры $OMARCHY_COLORS"
+    shift_state_field lcd_theme "\"$theme\""
+    lianli_apply "" "" 1 "aio-$theme" >/dev/null 2>&1 &
+    return 0
+}
+
 cmd_on() {
     local last
     last=$(state_get brightness)
@@ -762,6 +809,8 @@ case "${1:-status}" in
     status) shift || true; cmd_status "${1:-}" ;;
     set) shift || true; cmd_set "${1:-}" ;;
     lcd) shift || true; cmd_lcd "${1:-}" ;;
+    lcdtheme|lcd-theme) shift || true; cmd_lcdtheme "${1:-}" ;;
+    lcdthemes|lcd-themes) cmd_lcdthemes ;;
     on) cmd_on ;;
     off) cmd_off ;;
     toggle) cmd_toggle ;;

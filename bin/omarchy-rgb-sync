@@ -504,35 +504,11 @@ if os.path.exists(cfg_path):
         if apply:
             json.dump(cfg, open(cfg_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
 
-if os.path.exists(tpl_path):
-    doc = json.load(open(tpl_path, encoding="utf-8"))
-    before = json.dumps(doc, sort_keys=True, ensure_ascii=False)
-
-    def rgb_of(hex_color, alpha=255):
-        r, g, b = bytes.fromhex(hex_color.lstrip("#"))
-        return [r, g, b, alpha]
-
-    value_colors = {
-        "val-cpu-temp": accent,
-        "val-cpu-load": c4,
-        "val-gpu-temp": c6,
-        "val-gpu-load": c2,
-    }
-    for template in doc.get("templates", []):
-        background_cfg = template.get("background")
-        if isinstance(background_cfg, dict) and background_cfg.get("type") == "color":
-            background_cfg["rgb"] = rgb_of(background)
-        for widget in template.get("widgets", []):
-            kind = widget.get("kind") or {}
-            widget_id = widget.get("id", "")
-            if kind.get("type") == "label":
-                kind["color"] = rgb_of(c7)
-            elif kind.get("type") == "value_text":
-                kind["color"] = rgb_of(value_colors.get(widget_id, accent))
-    if json.dumps(doc, sort_keys=True, ensure_ascii=False) != before:
-        state["template"] = True
-        if apply:
-            json.dump(doc, open(tpl_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+# Шаблоны экрана хук больше не пишет сам. Раньше он раскрашивал один свой
+# макет, и любая выбранная пользователем тема экрана затиралась при смене
+# системной темы. Теперь шаблоны собирает плагин (bin/lcd_themes.py): он знает
+# выбранную тему и проверяет контраст надписей к фону.
+state["template"] = False
 
 print("config=%s template=%s" % (state["config"], state["template"]))
 PY
@@ -570,6 +546,24 @@ else
         fi
     else
         log "конфиг Lian Li без изменений ($lianli_state)"
+    fi
+
+    # Темы экрана собирает плагин из палитры текущей темы и оставляет выбранную
+    # пользователем. Контраст надписей к фону он считает сам, поэтому хук больше
+    # не пишет шаблон своим макетом — раньше он затирал выбранную тему.
+    rgb_cli=$(command -v omarchy-rgb 2>/dev/null || true)
+    if [[ -n $rgb_cli ]]; then
+        plugin_dir=$(dirname "$(readlink -f "$rgb_cli")")
+        rgb_themes="$plugin_dir/lcd_themes.py"
+        [[ -f $rgb_themes ]] || rgb_themes="$HOME/Projects/omarchy-rgb/bin/lcd_themes.py"
+        lcd_theme=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('lcd_theme') or 'grid')" \
+            "${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-rgb/state.json" 2>/dev/null || echo grid)
+        if [[ -f $rgb_themes ]]; then
+            python3 "$rgb_themes" --palette "$COLORS" --current "$LIANLI_TPL" \
+                --write "$LIANLI_TPL" >/dev/null 2>&1 || true
+        fi
+        OMARCHY_RGB_FORCE=1 "$rgb_cli" lcdtheme "${lcd_theme:-grid}" >/dev/null 2>&1 || true
+        log "экран водянки: тема ${lcd_theme:-grid}, цвета из палитры"
     fi
 fi
 
