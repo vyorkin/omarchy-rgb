@@ -263,17 +263,34 @@ lianli_lcd_brightness() {
 # intermediate levels turn into a single final one.
 OPENRGB_LOCK="${XDG_RUNTIME_DIR:-/tmp}/omarchy-rgb-openrgb.lock"
 
+# OpenRGB и яркость: у ASRock режим Static объявлен как
+# MODE_FLAG_HAS_PER_LED_COLOR без флага яркости, поэтому `-b` он игнорирует —
+# лента на ARGB-разъёме остаётся яркой. Яркость здесь тоже задаётся цветом:
+# акцент темы умножается на процент. `-b` всё равно передаём: драйверам, которые
+# флаг поддерживают, это не мешает.
+openrgb_color_for() {
+    local percent=$1
+    python3 - "$(accent_hex)" "$percent" <<'PY'
+import sys
+
+accent, percent = sys.argv[1].lstrip("#"), max(0, min(100, int(float(sys.argv[2]))))
+scale = percent / 100.0
+channels = [int(accent[index:index + 2], 16) for index in (0, 2, 4)]
+print("".join(f"{max(0, min(255, round(channel * scale))):02x}" for channel in channels))
+PY
+}
+
 openrgb_render() {
     local percent=$1 accent device
-    accent=$(accent_hex)
+    accent=$(openrgb_color_for "$percent")
     for device in "${OPENRGB_DEVICES[@]}"; do
         if (( percent <= 0 )); then
-            # Off, rather than brightness 0: some ASRock modes ignore brightness
-            # and would keep glowing.
+            # Off, rather than a black colour: some ASRock modes would otherwise
+            # keep the last colours and stay lit.
             timeout 60 openrgb --noautoconnect -d "$device" -m Off >/dev/null 2>&1 \
                 || log "OpenRGB: не удалось выключить '$device'"
         else
-            timeout 60 openrgb --noautoconnect -d "$device" -m Static -c "${accent#\#}" -b "$percent" \
+            timeout 60 openrgb --noautoconnect -d "$device" -m Static -c "$accent" -b "$percent" \
                 >/dev/null 2>&1 \
                 || log "OpenRGB: не удалось применить яркость к '$device'"
         fi
