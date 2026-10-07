@@ -301,8 +301,18 @@ if not skip_rgb and rgb and rgb.get("devices"):
 # экран гас и загорался, но память оставалась прежней, и демон возвращал своё
 # значение при первой же своей записи — из-за этого яркость «не держалась».
 if lcd_percent is not None:
-    whole = config.get("data") or {}
-    for entry in whole.get("lcds") or []:
+    # Нужны оба вызова, и это не перестраховка: SetLcdBrightness меняет сам экран
+    # (демон подтверждает applied), но не трогает свою копию настроек, а SetConfig
+    # обновляет копию, не трогая экран. По отдельности получается либо живая
+    # яркость, которая откатывается при следующей записи демона, либо запись без
+    # видимого эффекта.
+    write(guarded({
+        "method": "SetLcdBrightness",
+        "params": {"device_id": lcd_device, "brightness": lcd_percent},
+    }))
+    whole = dict(config.get("data") or {})
+    whole["lcds"] = [dict(entry) for entry in whole.get("lcds") or []]
+    for entry in whole["lcds"]:
         entry["brightness"] = lcd_percent
     write(guarded({"method": "SetConfig", "params": {"config": whole}}))
 

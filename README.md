@@ -236,11 +236,12 @@ because they are different devices and dimming the strips should not dim the scr
 The screen's value lives in `lcd_brightness` beside the level, and the theme hook
 reads it, so a theme switch no longer resets it.
 
-The screen's brightness has to go through `SetConfig`, not `SetLcdBrightness`. The
-latter changes the screen but leaves the daemon's own copy of the LCD settings
-alone, so the daemon put its stale value back at the first save - which is why the
-screen used to ignore the slider entirely. `SetConfig` carries the screen's settings
-with it and updates both. The 8.8" case panel still follows the lighting slider.
+The screen's brightness needs **both** calls, and that is not belt and braces:
+`SetLcdBrightness` changes the screen (the daemon answers `applied: true`) but leaves
+its own copy of the LCD settings alone, so the daemon writes the stale value back at
+its next save; `SetConfig` updates that copy but does not touch the screen, so on its
+own it changes nothing you can see. Sending the pair is what makes the slider both
+visible and permanent. The 8.8" case panel still follows the lighting slider.
 
 ## Configure
 
