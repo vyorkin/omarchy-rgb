@@ -85,8 +85,11 @@ State lives in `${XDG_STATE_HOME:-~/.local/state}/omarchy-rgb/state.json`, so
 device — which is far too slow to sit behind a slider. Two paths fix that:
 
 - **The board.** `bin/openrgb-fast.py` speaks the OpenRGB SDK protocol straight
-  to a background `openrgb --server`, so a colour change is a single packet
-  (~15 ms) instead of a full scan. The server is started on demand — the first
+  to a background `openrgb --server`: the colour goes into the LED array and the
+  mode is re-applied, which is the same thing `openrgb -m Static -c ...` does,
+  in about 17 ms instead of a second of re-detecting the machine. The command
+  line stays as the fallback, and the graphics card is only ever written that
+  way because it has no LEDs for an array. The server is started on demand — the first
   change after a boot falls back to the slow path in the background and warms the
   server up, so everything after it is immediate.
 - **Lian Li.** Brightness goes over the daemon's socket. The guard that a write

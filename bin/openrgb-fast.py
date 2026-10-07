@@ -313,6 +313,130 @@ def resolve(names: list[str], sock: socket.socket) -> dict:
     return cache
 
 
+PACKET_UPDATE_MODE = 1101
+
+
+class BlobReader:
+    """Читает описание устройства так, как его отдаёт сервер OpenRGB."""
+
+    def __init__(self, data: bytes) -> None:
+        self.data = data
+        self.pos = 0
+
+    def u32(self) -> int:
+        value = struct.unpack("<I", self.data[self.pos : self.pos + 4])[0]
+        self.pos += 4
+        return value
+
+    def u16(self) -> int:
+        value = struct.unpack("<H", self.data[self.pos : self.pos + 2])[0]
+        self.pos += 2
+        return value
+
+    def text(self) -> str:
+        length = self.u16()
+        raw = self.data[self.pos : self.pos + length]
+        self.pos += length
+        return raw.split(b"\x00")[0].decode("utf-8", errors="replace")
+
+    def mode(self) -> dict:
+        # Сервер отдаёт девять 32-битных полей и счётчик цветов. Порядок полей:
+        # значение режима, флаги, границы скорости, границы числа цветов,
+        # скорость, яркость и способ окраски.
+        record = {
+            "name": self.text(),
+            "value": self.u32(),
+            "flags": self.u32(),
+            "speed_min": self.u32(),
+            "speed_max": self.u32(),
+            "colors_min": self.u32(),
+            "colors_max": self.u32(),
+            "speed": self.u32(),
+            "brightness": self.u32(),
+            "color_mode": self.u32(),
+        }
+        record["colors"] = [self.u32() for _ in range(self.u16())]
+        return record
+
+    def device(self) -> dict:
+        self.u32()  # размер данных
+        info = {"type": self.u32(), "name": self.text(), "vendor": self.text(),
+                "description": self.text(), "version": self.text(),
+                "serial": self.text(), "location": self.text()}
+        info["modes"] = [self.mode() for _ in range(self.u16())]
+        info["zone_count"] = self.u16()
+        info["led_count"] = self.pos  # заполняется ниже, после разбора зон
+        return info
+
+
+def parse_modes(body: bytes) -> list[dict]:
+    """Возвращает список режимов устройства из его описания."""
+    reader = BlobReader(body)
+    reader.u32()
+    reader.u32()
+    # name, vendor, description, version, serial, location
+    for _ in range(5):
+        reader.text()
+    count = reader.u16()
+    reader.u32()  # индекс активного режима
+    return [reader.mode() for _ in range(count)]
+
+
+def pack_mode(record: dict) -> bytes:
+    name = record["name"].encode("utf-8") + b"\x00"
+    out = struct.pack("<H", len(name)) + name
+    out += struct.pack(
+        "<IIIIIIIII",
+        record["value"], record["flags"], record["speed_min"], record["speed_max"],
+        record["colors_min"], record["colors_max"], record["speed"],
+        record["brightness"], record["color_mode"],
+    )
+    colors = record["colors"]
+    out += struct.pack("<H", len(colors))
+    out += b"".join(struct.pack("<I", color) for color in colors)
+    return out
+
+
+def set_mode_fast(percent: int, accent: str, name: str, port: int = 6742) -> int:
+    """Задаёт цвет платы так же, как командная строка, но по протоколу.
+
+    Драйвер ASRock берёт цвет для режима из массива светодиодов зоны, поэтому
+    записи две: сначала новый цвет в массив, затем повторное применение режима,
+    которое этим цветом и закрашивает ленту. Вместе это десятки миллисекунд
+    против секунды, которую командная строка тратит на опрос всей машины.
+    """
+    if not server_running():
+        return 3
+    sock = connect(4.0)
+    if sock is None:
+        return 3
+    try:
+        entry = resolve([name], sock).get(name)
+        if not entry:
+            return 3
+        index = entry["index"]
+        if not entry.get("leds"):
+            return 3
+        send(sock, index, PACKET_REQUEST_CONTROLLER_DATA)
+        packet = read_until(sock, PACKET_REQUEST_CONTROLLER_DATA, 4.0)
+        if packet is None:
+            return 3
+        modes = parse_modes(packet[2])
+        wanted = "Off" if percent <= 0 else "Static"
+        target = next((i for i, m in enumerate(modes) if m["name"] == wanted), None)
+        if target is None:
+            return 3
+        color = scaled_color(accent, percent)
+        update_leds(sock, index, entry["leds"], color)
+        record = dict(modes[target])
+        record["colors"] = []
+        payload = struct.pack("<II", 8 + len(pack_mode(record)), target) + pack_mode(record)
+        send(sock, index, PACKET_UPDATE_MODE, payload)
+        return 0
+    finally:
+        sock.close()
+
+
 def set_mode(percent: int, accent: str, names: list[str], port: int = 6742) -> int:
     """Задаёт цвет режимом, через уже поднятый сервер OpenRGB.
 
@@ -440,6 +564,11 @@ def main(argv: list[str]) -> int:
         if len(argv) < 5:
             return 2
         return verify(int(float(argv[2])), argv[3], argv[4:])
+    if action == "fastmode":
+        # Один именованный контроллер, напрямую по протоколу (десятки миллисекунд).
+        if len(argv) < 5:
+            return 2
+        return set_mode_fast(int(float(argv[2])), argv[3], argv[4])
     if action == "mode":
         if len(argv) < 5:
             return 2
