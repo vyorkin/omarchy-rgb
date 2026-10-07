@@ -411,7 +411,7 @@ PY
         wrote=no
         # Видеокарту не пишем: OpenRGB её не контролирует (устройство остаётся Off),
         # а каждая лишняя запись — это ещё секунда.
-        if [[ -n $board_writer ]] && python3 "$board_writer" fastmode "$rgb_level" "$accent" \
+        if [[ -n $board_writer ]] && python3 "$board_writer" mode "$rgb_level" "$accent" \
             "ASRock X870 Pro RS WiFi" >/dev/null 2>&1; then
             wrote=yes
             log "OpenRGB: цвет платы и видеокарты записан через сервер"

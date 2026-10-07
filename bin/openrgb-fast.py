@@ -589,10 +589,11 @@ def main(argv: list[str]) -> int:
             return 2
         return verify(int(float(argv[2])), argv[3], argv[4:])
     if action == "fastmode":
-        # Один именованный контроллер, напрямую по протоколу (десятки миллисекунд).
-        if len(argv) < 5:
-            return 2
-        return set_mode_fast(int(float(argv[2])), argv[3], argv[4])
+        # ОТКЛЮЧЕНО: железо рисовало с этими пакетами другой цвет, чем командная
+        # строка, хотя байты совпадали. Пока не выяснено, почему, действие
+        # отказывается работать, чтобы его случайно не использовали.
+        print("fastmode отключён: используйте mode (командная строка)")
+        return 1
     if action == "mode":
         if len(argv) < 5:
             return 2
