@@ -129,13 +129,13 @@ lianli_apply() {
     lianli_available || return 0
     [[ $percent =~ ^[0-9]+$ ]] || percent=0
     out=$(python3 - "$LIANLI_SOCKET" "$LIANLI_COLORS" "$percent" "$(accent_hex)" \
-        "$GUARD_CACHE" "$AIO_LCD_DEVICE" <<'INNER'
+        "$GUARD_CACHE" "$AIO_LCD_DEVICE" "${XDG_CONFIG_HOME:-$HOME/.config}/lianli/config.json" <<'INNER'
 import json
 import os
 import socket
 import sys
 
-socket_path, colors_path, percent_raw, accent, guard_cache, lcd_device = sys.argv[1:7]
+socket_path, colors_path, percent_raw, accent, guard_cache, lcd_device, config_path = sys.argv[1:8]
 percent = max(0, min(100, int(float(percent_raw))))
 accent = accent.lstrip("#")
 
@@ -290,6 +290,28 @@ write(guarded({
     "method": "SetLcdBrightness",
     "params": {"device_id": lcd_device, "brightness": percent},
 }))
+
+# Демон при следующем запуске берёт яркость экрана из файла конфигурации, а живая
+# запись по IPC в файл не попадает. Держим их согласованными, иначе после смены
+# темы (демон перезапускается) яркость откатывается к прежней.
+try:
+    with open(config_path, encoding="utf-8") as handle:
+        on_disk = json.load(handle)
+except (OSError, ValueError):
+    on_disk = None
+if on_disk is not None:
+    changed = False
+    for entry in on_disk.get("lcds") or []:
+        if entry.get("brightness") != percent:
+            entry["brightness"] = percent
+            changed = True
+    if changed:
+        try:
+            with open(config_path, "w", encoding="utf-8") as handle:
+                json.dump(on_disk, handle, ensure_ascii=False, indent=2)
+        except OSError as error:
+            print(f"cannot update {config_path}: {error}")
+
 connection.close()
 # Ненулевой код велит оболочке повторить попытку в фоне: демон мог ещё
 # поднимать устройства после перезапуска.
