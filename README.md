@@ -81,21 +81,44 @@ State lives in `${XDG_STATE_HOME:-~/.local/state}/omarchy-rgb/state.json`, so
 
 ## Latency
 
-`openrgb` detects the whole machine on every run — about three seconds per
-device — so waiting for it made the slider feel dead. The script therefore
-applies the fast targets first, in parallel, and hands the board to a detached
-worker:
+`openrgb` re-detects the whole machine on every run — about three seconds per
+device — which is far too slow to sit behind a slider. Two paths fix that:
+
+- **The board.** `bin/openrgb-fast.py` speaks the OpenRGB SDK protocol straight
+  to a background `openrgb --server`, so a colour change is a single packet
+  (~15 ms) instead of a full scan. The server is started on demand — the first
+  change after a boot falls back to the slow path in the background and warms the
+  server up, so everything after it is immediate.
+- **Lian Li.** Brightness goes over the daemon's socket. The guard that a write
+  needs is cached on disk, the cooler screen's backlight rides in the same
+  process, and the command stops waiting after 150 ms: the daemon sometimes holds
+  a queue while it uploads frames to the wireless strips, and the interface must
+  not wait for that.
 
 | Target | Time to apply |
 |---|---|
-| Lian Li devices (socket) | ~50 ms |
-| Cooler screen backlight | ~50 ms |
-| 8.8" panel (`bezel`) | ~16 ms |
-| Motherboard and graphics card | a few seconds, in the background |
+| Lian Li devices (socket) | ~60 ms |
+| Motherboard and graphics card (SDK) | ~15 ms |
+| Cooler screen backlight | ~60 ms |
+| 8.8" panel (`bezel`) | ~15 ms |
+| Whole `set` command | 70–190 ms |
 
-The worker takes a lock and reads the current state when it gets it, so a drag
-collapses into one write instead of twenty. The widget pushes the level while
-you drag, throttled to 120 ms, and does not re-read the state on every step.
+Measured end to end: `omarchy-rgb set N` went from 6.3 s to 70–190 ms, an
+unchanged value costs 4 ms and touches nothing, and six rapid changes collapse
+into one write instead of six.
+
+## Brightness through colour
+
+Lian Li's firmware has five brightness levels, and the plain brightness field of
+an ASRock mode is not even acknowledged by the driver (`MODE_FLAG_HAS_PER_LED_COLOR`
+without the brightness flag). Both therefore dim by scaling the **colour**: the
+theme accent is multiplied by the level, so 3% is really `#020706` and not "the
+dimmest of five steps". Switching off sends black rather than a mode change, which
+is why it is instant as well.
+
+The accent of the current Omarchy theme is the single source of that colour, the
+same one the theme hook writes. Per-zone colours set by hand in the Lian Li GUI
+are replaced by it whenever the slider moves.
 
 ## Configure
 

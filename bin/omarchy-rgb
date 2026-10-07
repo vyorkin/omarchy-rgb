@@ -52,201 +52,223 @@ accent_hex() {
 }
 
 # --- state --------------------------------------------------------------------
+#
+# The file is flat and written by bash on purpose: every field used to be read by
+# a python process of its own, and four of those per slider step cost more than
+# the hardware work below. The Lian Li colour base lives in its own file, so this
+# one can be rewritten wholesale without losing anything.
+STATE_FILE="$STATE_DIR/state.json"
+LIANLI_COLORS="$STATE_DIR/lianli-colors.json"
+GUARD_CACHE="$STATE_DIR/lianli-guard.json"
+
+state_default() { printf '{"on":true,"brightness":100,"generation":0,"fast_percent":-1}'; }
 
 state_read() {
-    if [[ -r $STATE_FILE ]]; then
-        cat "$STATE_FILE"
-    else
-        printf '{"on":true,"brightness":100}'
-    fi
+    if [[ -r $STATE_FILE ]]; then cat "$STATE_FILE"; else state_default; fi
 }
 
-# Merges into the state file instead of rewriting it: the Lian Li helper keeps
-# its colour base in the same file and must not lose it on every slider move.
-state_write() {
-    local on=$1 brightness=$2 generation
-    generation=$(date +%s%N)
-    mkdir -p "$STATE_DIR"
-    python3 - "$STATE_FILE" "$on" "$brightness" "$generation" <<'PY'
-import json
-import os
-import sys
+# state_get <field> — печатает значение поля или пусто.
+state_get() {
+    local field=$1
+    [[ -r $STATE_FILE ]] || return 0
+    sed -n "s/.*\"$field\": *\(\"[^\"]*\"\|[^,}]*\).*/\1/p" "$STATE_FILE" | tr -d '"' | head -n1
+}
 
-path, on, brightness, generation = sys.argv[1:5]
-try:
-    with open(path, encoding="utf-8") as handle:
-        state = json.load(handle)
-except (OSError, ValueError):
-    state = {}
-state["on"] = on == "true"
-state["brightness"] = int(brightness)
-# Номер изменения: фоновый воркер по нему понимает, что за время его работы
-# появилось более свежее значение, и применяет новое вместо устаревшего.
-state["generation"] = generation
-with open(path + ".tmp", "w", encoding="utf-8") as handle:
-    json.dump(state, handle, ensure_ascii=False)
-os.replace(path + ".tmp", path)
-print(generation)
-PY
+# shift_state_field <field> <value> — меняет одно поле, остальные не трогает.
+shift_state_field() {
+    local field=$1 value=$2 body new
+    body=$(state_read)
+    if printf '%s' "$body" | grep -q "\"$field\":"; then
+        new=$(printf '%s' "$body" | sed "s/\"$field\":[^,}]*/\"$field\":$value/")
+    else
+        new=$(printf '%s' "$body" | sed "s/}$/,\"$field\":$value}/")
+    fi
+    printf '%s\n' "$new" >"$STATE_FILE.tmp" && mv "$STATE_FILE.tmp" "$STATE_FILE"
+}
+
+state_mark_applied() { shift_state_field openrgb_applied "${1:-0}"; }
+state_mark_fast() { shift_state_field fast_percent "${1:-0}"; }
+
+# state_write <on> <brightness> — печатает номер изменения.
+state_write() {
+    local on=$1 brightness=$2 generation previous_fast
+    generation=$(date +%s%N)
+    previous_fast=$(state_get fast_percent)
+    [[ $previous_fast =~ ^-?[0-9]+$ ]] || previous_fast=-1
+    mkdir -p "$STATE_DIR"
+    printf '{"on":%s,"brightness":%s,"generation":"%s","fast_percent":%s}\n' \
+        "$on" "$brightness" "$generation" "$previous_fast" >"$STATE_FILE.tmp"
+    mv "$STATE_FILE.tmp" "$STATE_FILE"
+    printf '%s' "$generation"
 }
 
 # --- Lian Li IPC --------------------------------------------------------------
-
+#
 # Everything Lian Li goes through the daemon's Unix socket: newline-delimited
 # JSON, one response per request. Writes must carry a WriteGuard — the daemon
-# refuses anonymous changes — so the helper asks for DaemonInfo first and wraps
-# every write. Reading the guard needs no privileges: it only pins the daemon
-# version and instance id.
+# refuses anonymous changes — and the guard is cached on disk, because asking for
+# it costs a round trip on every slider step. The guard only changes when the
+# daemon restarts, and a stale one is retried once with a fresh copy.
 #
-# Brightness is applied through the colour, not the firmware level: that scale
-# has only five steps, so 3% would become 25% and stay bright. The widget keeps
-# the level at maximum and multiplies the zone colours instead, which gives a
-# percent-per-percent curve. The untouched colours are remembered per zone, so
-# the scaling never compounds, and a colour change made elsewhere (a theme
+# Brightness is applied through the colour, not the firmware level: that scale has
+# only five steps, so 3% would become 25% and stay bright. The level stays at
+# maximum and the zone colours are multiplied instead. The untouched colours are
+# remembered per zone in their own file — the state file is flat and owned by bash
+# — so the scaling never compounds, and a colour change made elsewhere (a theme
 # switch, the Lian Li GUI) becomes the new base.
+#
+# The cooler screen's backlight rides along in the same process and on the same
+# connection: a second call cost another process and another round trip.
 lianli_available() {
     [[ -S $LIANLI_SOCKET ]] && command -v python3 >/dev/null 2>&1
 }
 
-# lianli_send zones <percent> | lianli_send lcd <percent> <device>
-lianli_send() {
-    local action=${1:-zones}
-    lianli_available || return 1
-    python3 - "$LIANLI_SOCKET" "$STATE_FILE" "$action" "${2:-0}" "${3:-}" <<'INNER'
+# lianli_apply <percent>
+lianli_apply() {
+    local percent=${1:-0} out
+    lianli_available || return 0
+    [[ $percent =~ ^[0-9]+$ ]] || percent=0
+    out=$(python3 - "$LIANLI_SOCKET" "$LIANLI_COLORS" "$percent" "$(accent_hex)" \
+        "$GUARD_CACHE" "$AIO_LCD_DEVICE" <<'INNER'
 import json
 import os
 import socket
 import sys
 
-socket_path, state_path, action, amount, device = sys.argv[1:6]
-percent = max(0, min(100, int(float(amount))))
-disabled = percent <= 0
+socket_path, colors_path, percent_raw, accent, guard_cache, lcd_device = sys.argv[1:7]
+percent = max(0, min(100, int(float(percent_raw))))
+accent = accent.lstrip("#")
 
 
-def call(request):
+def call(request, connection=None):
     """One request, one response line."""
+    own = connection is None
+    if own:
+        try:
+            connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            connection.settimeout(6)
+            connection.connect(socket_path)
+        except OSError as error:
+            return {"status": "error", "message": str(error)}
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-            sock.settimeout(6)
-            sock.connect(socket_path)
-            sock.sendall(json.dumps(request).encode() + b"\n")
-            buf = b""
-            while b"\n" not in buf:
-                chunk = sock.recv(65536)
-                if not chunk:
-                    break
-                buf += chunk
-    except OSError as error:
-        return {"status": "error", "message": str(error)}
-    try:
+        connection.sendall(json.dumps(request).encode() + b"\n")
+        buf = b""
+        while b"\n" not in buf:
+            chunk = connection.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
         return json.loads(buf.decode(errors="replace"))
-    except ValueError:
-        return {"status": "error", "message": "unreadable response"}
+    except (OSError, ValueError) as error:
+        return {"status": "error", "message": str(error)}
+    finally:
+        if own:
+            connection.close()
 
 
-info = call({"method": "GetDaemonInfo"})
-if info.get("status") != "ok":
-    print(info.get("message", "daemon did not answer"))
-    sys.exit(0)
-daemon = info["data"]
-# Claiming the daemon's own version is what the GUI does too: the guard exists to
-# make sure both sides agree, not to authenticate a particular program.
-guard = {
-    "client_version": daemon.get("version"),
-    "protocol_version": daemon.get("protocol_version"),
-    "instance_id": daemon.get("instance_id"),
-}
-
-
-def write(request):
-    response = call({"method": "Guarded", "params": {"guard": guard, "request": request}})
-    if response.get("status") != "ok":
-        print(response.get("message", "write rejected"))
-    return response
-
-
-if action == "lcd":
-    write({
-        "method": "SetLcdBrightness",
-        "params": {"device_id": device, "brightness": percent},
-    })
-    sys.exit(0)
-
-config = call({"method": "GetConfig"})
-if config.get("status") != "ok":
-    print(config.get("message", "cannot read the daemon config"))
-    sys.exit(0)
-
-rgb = config["data"].get("rgb")
-if not rgb or not rgb.get("devices"):
-    print("no RGB devices in the daemon config")
-    sys.exit(0)
-
-
-def read_state():
+def read_json(path):
     try:
-        with open(state_path, encoding="utf-8") as handle:
+        with open(path, encoding="utf-8") as handle:
             return json.load(handle)
     except (OSError, ValueError):
         return {}
 
 
-state = read_state()
-base = state.get("lianli_base") or {}
-sent = state.get("lianli_sent") or {}
+def write_json(path, payload):
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + ".tmp", "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False)
+        os.replace(path + ".tmp", path)
+    except OSError:
+        pass
+
+
+def make_guard():
+    info = call({"method": "GetDaemonInfo"})
+    if info.get("status") != "ok":
+        return None
+    daemon = info["data"]
+    guard = {
+        "client_version": daemon.get("version"),
+        "protocol_version": daemon.get("protocol_version"),
+        "instance_id": daemon.get("instance_id"),
+    }
+    write_json(guard_cache, guard)
+    return guard
+
+
+cached = read_json(guard_cache)
+guard = cached if cached.get("instance_id") else make_guard()
+if not guard:
+    print("daemon did not answer")
+    sys.exit(0)
+
+connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+connection.settimeout(6)
+try:
+    connection.connect(socket_path)
+except OSError as error:
+    print(f"cannot reach the daemon: {error}")
+    sys.exit(0)
+
+
+def write(request):
+    global guard
+    response = call(request, connection)
+    if response.get("status") != "ok" and "daemon changed" in str(response.get("message", "")).lower():
+        renewed = make_guard()
+        if renewed:
+            guard = renewed
+            response = call(request, connection)
+    if response.get("status") != "ok":
+        print(response.get("message", "write rejected"))
+    return response
+
+
+def guarded(request):
+    return {"method": "Guarded", "params": {"guard": guard, "request": request}}
+
+
+config = call({"method": "GetConfig"}, connection)
+if config.get("status") != "ok":
+    print(config.get("message", "cannot read the daemon config"))
+    connection.close()
+    sys.exit(0)
+
+rgb = config["data"].get("rgb")
+accent_rgb = [int(accent[index:index + 2], 16) for index in (0, 2, 4)]
 scale = percent / 100.0
 
-for device_entry in rgb.get("devices", []):
-    device_id = device_entry.get("device_id", "")
-    for zone in device_entry.get("zones", []):
-        effect = dict(zone.get("effect") or {})
-        key = f"{device_id}:{zone.get('zone_index', 0)}"
-        current = [list(color) for color in (effect.get("colors") or [])]
+if rgb and rgb.get("devices"):
+    for device_entry in rgb.get("devices", []):
+        device_id = device_entry.get("device_id", "")
+        for zone in device_entry.get("zones", []):
+            effect = dict(zone.get("effect") or {})
+            # Основой всегда служит акцент темы — тот же цвет, что ставит хук темы.
+            # Раньше мы запоминали цвета из конфига, но туда попадали наши же
+            # затемнённые значения, база «отравлялась» и свет переставал
+            # разгораться. Один источник истины надёжнее.
+            effect["colors"] = [
+                [max(0, min(255, round(channel * scale))) for channel in accent_rgb]
+            ]
+            # Уровень держим максимальным: яркость задаётся цветом.
+            effect["brightness"] = 4 if percent > 0 else 0
+            effect["disabled"] = percent <= 0
+            zone["effect"] = effect
 
-        # Что-то кроме нас поменяло цвет (тема, GUI) — принимаем это за основу.
-        if sent.get(key) != current:
-            base[key] = current
-        reference = base.get(key) or current or [[255, 255, 255]]
-        scaled = [
-            [max(0, min(255, round(channel * scale))) for channel in color]
-            for color in reference
-        ]
+    # Одна запись на все устройства: демон сам разворачивает области и регионы.
+    # Сырой SetRgbEffect для лент не годится — он отвергает Static вне их области.
+    write(guarded({"method": "SetRgbConfig", "params": {"config": rgb}}))
 
-        effect["colors"] = scaled
-        # Уровень держим максимальным: яркость задаётся цветом.
-        effect["brightness"] = 4 if percent > 0 else 0
-        effect["disabled"] = disabled
-        zone["effect"] = effect
-        sent[key] = scaled
-
-# Одна запись на все устройства: демон сам разворачивает области и регионы.
-# Сырой SetRgbEffect для лент не годится — он отвергает Static вне их области.
-write({"method": "SetRgbConfig", "params": {"config": rgb}})
-
-state["lianli_base"] = base
-state["lianli_sent"] = sent
-try:
-    os.makedirs(os.path.dirname(state_path), exist_ok=True)
-    with open(state_path + ".tmp", "w", encoding="utf-8") as handle:
-        json.dump(state, handle, ensure_ascii=False)
-    os.replace(state_path + ".tmp", state_path)
-except OSError as error:
-    print(f"cannot store scaling base: {error}")
+write(guarded({
+    "method": "SetLcdBrightness",
+    "params": {"device_id": lcd_device, "brightness": percent},
+}))
+connection.close()
 INNER
-}
-
-lianli_apply() {
-    local percent=$1 out
-    out=$(lianli_send zones "$percent")
+)
     [[ -n $out ]] && log "Lian Li: $(printf '%s' "$out" | head -c 200)"
-    return 0
-}
-
-lianli_lcd_brightness() {
-    local percent=$1 out
-    [[ -S $LIANLI_SOCKET ]] || return 0
-    out=$(lianli_send lcd "$percent" "$AIO_LCD_DEVICE")
-    [[ -n $out ]] && log "Lian Li LCD: $(printf '%s' "$out" | head -c 200)"
     return 0
 }
 
@@ -321,8 +343,8 @@ openrgb_render() {
 
 openrgb_apply_state() {
     local on brightness
-    on=$(read_state_field on)
-    brightness=$(read_state_field brightness)
+    on=$(state_get on)
+    brightness=$(state_get brightness)
     [[ -n $on ]] || on=true
     [[ -n $brightness ]] || brightness=100
     if [[ $on == false || $brightness == 0 ]]; then
@@ -347,10 +369,10 @@ openrgb_async() {
         # значение. Работать здесь — это ещё одна перезапись платы, а каждая
         # такая перезапись видна как короткое мигание ленты.
         local current applied
-        current=$(read_state_field generation)
+        current=$(state_get generation)
         [[ -n $spawn_generation && -n $current && $spawn_generation != "$current" ]] && exit 0
 
-        applied=$(read_state_field openrgb_applied)
+        applied=$(state_get openrgb_applied)
         [[ -n $current && $current == "$applied" ]] && exit 0
 
         openrgb_apply_state
@@ -368,10 +390,33 @@ bezel_apply() {
 
 # --- commands -----------------------------------------------------------------
 
+# wait_limited <milliseconds> <pids...> — ждём не дольше указанного, оставшиеся дети
+# продолжают работать и доедут сами.
+wait_limited() {
+    local ms=$1
+    shift
+    local ticks=$(( ms / 10 ))
+    (( ticks < 1 )) && ticks=1
+    local tick=0 alive pid
+    while (( tick < ticks )); do
+        alive=0
+        for pid in "$@"; do
+            kill -0 "$pid" 2>/dev/null && alive=1
+        done
+        (( alive == 0 )) && return 0
+        sleep 0.01
+        tick=$(( tick + 1 ))
+    done
+    return 0
+}
+
 apply_all() {
     local on=$1 brightness=$2 generation=${3:-}
     local percent=$brightness
     (( percent < 0 )) && percent=0
+    # Выключено — значит ноль на всех целях. В состоянии при этом остаётся
+    # последняя яркость, чтобы кнопка «включить» знала, куда возвращаться.
+    [[ $on == false ]] && percent=0
 
     # Шаг 5% для быстрых целей: ленты и экраны получают заметно меньше
     # перерисовок, а глаз разницы между 40% и 42% всё равно не видит. Плата ниже
@@ -388,13 +433,15 @@ apply_all() {
     (( percent == 0 )) && fast=0
 
     local last_fast
-    last_fast=$(read_state_field fast_percent)
+    last_fast=$(state_get fast_percent)
     if [[ $last_fast != "$fast" || ${OMARCHY_RGB_FORCE:-0} == 1 ]]; then
         local pids=()
         lianli_apply "$fast" & pids+=($!)
-        lianli_lcd_brightness "$fast" & pids+=($!)
         bezel_apply "$fast" & pids+=($!)
-        for pid in "${pids[@]}"; do wait "$pid"; done
+        # Ждём не дольше 150 мс. Демон Lian Li иногда занят заливкой кадров по
+        # радио и держит очередь до секунды — интерфейс из-за этого дёргаться не
+        # должен: не дождались, значит значение доедет в фоне.
+        wait_limited 150 "${pids[@]}"
         state_mark_fast "$fast"
     fi
 
@@ -455,8 +502,8 @@ cmd_status() {
     local json=0
     [[ ${1:-} == --json ]] && json=1
     local on brightness accent
-    on=$(read_state_field on)
-    brightness=$(read_state_field brightness)
+    on=$(state_get on)
+    brightness=$(state_get brightness)
     [[ -n $on ]] || on=true
     [[ -n $brightness ]] || brightness=100
     accent=$(accent_hex)
@@ -481,7 +528,7 @@ cmd_set() {
         on=false
         # Off keeps the previous level, so `on` has something to restore.
         local last
-        last=$(read_state_field brightness)
+        last=$(state_get brightness)
         [[ -n $last && $last != 0 ]] || last=100
         brightness=$last
     else
@@ -492,8 +539,8 @@ cmd_set() {
     # значения заставляет ленты и плату перерисоваться, и это видно.
     if [[ ${OMARCHY_RGB_FORCE:-0} != 1 ]]; then
         local was_on was_brightness
-        was_on=$(read_state_field on)
-        was_brightness=$(read_state_field brightness)
+        was_on=$(state_get on)
+        was_brightness=$(state_get brightness)
         if [[ ${was_on:-true} == "$on" && ${was_brightness:-} == "$brightness" ]]; then
             return 0
         fi
@@ -508,7 +555,7 @@ cmd_set() {
 
 cmd_on() {
     local last
-    last=$(read_state_field brightness)
+    last=$(state_get brightness)
     [[ -n $last && $last != 0 ]] || last=100
     cmd_set "$last"
 }
@@ -517,7 +564,7 @@ cmd_off() { cmd_set 0; }
 
 cmd_toggle() {
     local on
-    on=$(read_state_field on)
+    on=$(state_get on)
     [[ -n $on ]] || on=true
     if [[ $on == true ]]; then cmd_off; else cmd_on; fi
 }
