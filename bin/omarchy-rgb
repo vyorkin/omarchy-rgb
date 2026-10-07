@@ -582,7 +582,9 @@ wait_limited() {
 }
 
 apply_all() {
-    local on=$1 brightness=$2 generation=${3:-}
+    # lcd_target — яркость экрана, если её нужно изменить этим же вызовом.
+    # Пусто означает "не трогать экран".
+    local on=$1 brightness=$2 generation=${3:-} lcd_target=${4:-}
     local percent=$brightness
     (( percent < 0 )) && percent=0
     # Выключено — значит ноль на всех целях. В состоянии при этом остаётся
@@ -607,7 +609,7 @@ apply_all() {
     last_fast=$(state_get fast_percent)
     if [[ $last_fast != "$fast" || ${OMARCHY_RGB_FORCE:-0} == 1 ]]; then
         local pids=()
-        lianli_apply "$fast" & pids+=($!)
+        lianli_apply "$fast" "$lcd_target" & pids+=($!)
         bezel_apply "$fast" & pids+=($!)
         # Ждём не дольше 150 мс. Демон Lian Li иногда занят заливкой кадров по
         # радио и держит очередь до секунды — интерфейс из-за этого дёргаться не
@@ -726,16 +728,19 @@ cmd_set() {
     generation=$(state_write "$on" "$brightness")
     # Экран трогаем только при переходе между включено и выключено: у него своя
     # яркость и свой ползунок, и дёргать его на каждом шаге подсветки не нужно.
+    # Значение передаём в ту же запись, что и подсветку: отдельный вызов экрана
+    # отправляет ВСЮ конфигурацию через SetConfig, и если он успевал прочитать её
+    # до записи выключения, то возвращал прежние цвета — лента и помпа оставались
+    # гореть.
+    local lcd_target=
     if [[ ${was_on:-true} != "$on" ]]; then
-        local lcd_target
         lcd_target=$(state_get lcd_brightness)
         [[ $lcd_target =~ ^[0-9]+$ ]] || lcd_target=100
         # Сравнение строкой: при set -u арифметика пытается разыменовать слово
         # "false" как переменную и падает.
         [[ $on == false ]] && lcd_target=0
-        lianli_apply "" "$lcd_target" 1 >/dev/null 2>&1 &
     fi
-    apply_all "$on" "$brightness" "$generation"
+    apply_all "$on" "$brightness" "$generation" "$lcd_target"
 }
 
 # Яркость экрана водянки: своя величина, отдельная от подсветки. Экран живёт на
@@ -753,9 +758,15 @@ cmd_lcd() {
     fi
 
     shift_state_field lcd_brightness "$percent"
+    # Передаём и текущую подсветку: SetConfig отправляет конфигурацию целиком, и
+    # без этого он мог вернуть прежние цвета, если запись подсветки ещё не дошла.
+    local level
+    level=$(state_get brightness)
+    [[ $level =~ ^[0-9]+$ ]] || level=100
+    [[ $(state_get on) == false ]] && level=0
     # В фоне: запись по IPC иногда ждёт подтверждения демона до нескольких
     # секунд, и интерфейс из-за этого дёргаться не должен.
-    lianli_apply "" "$percent" 1 >/dev/null 2>&1 &
+    lianli_apply "$level" "$percent" >/dev/null 2>&1 &
     return 0
 }
 
