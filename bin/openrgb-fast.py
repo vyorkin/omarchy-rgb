@@ -26,6 +26,7 @@ Exit codes: 0 ok, 3 no server (the caller falls back to the slow path).
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import socket
@@ -240,21 +241,46 @@ def scaled_color(accent: str, percent: int) -> int:
     return (channels[0] << 16) | (channels[1] << 8) | channels[2]
 
 
+def resolve(names: list[str], sock: socket.socket) -> dict:
+    """Возвращает имя -> запись кэша, проверяя, что индекс всё ещё тот самый.
+
+    Порядок устройств на сервере не постоянен: он зависит от того, какие
+    устройства успели определиться. Писать цвет по устаревшему индексу означает
+    покрасить чужое устройство и оставить нужное как было, поэтому индекс
+    подтверждается именем, а при расхождении кэш пересобирается.
+    """
+    cache = read_cache()
+    stale = False
+    for name in names:
+        entry = cache.get(name)
+        if not entry or not isinstance(entry.get("index"), int):
+            stale = True
+            break
+        actual = device_name(sock, entry["index"])
+        if actual != name:
+            stale = True
+            break
+    if stale:
+        discover(names)
+        cache = read_cache()
+    return cache
+
+
 def apply(percent: int, accent: str, names: list[str]) -> int:
     # Сервер здесь не поднимаем: если его нет, вызывающий уходит на медленный
     # путь, а подъём делает отдельная команда warmup — она долгая (несколько
     # секунд) и в кадре ползунка ей делать нечего.
     if not server_running():
         return 3
-    cache = read_cache()
-    if any(name not in cache for name in names):
-        return 3
-
-    color = scaled_color(accent, percent)
     sock = connect(4.0)
     if sock is None:
         return 3
     try:
+        cache = resolve(names, sock)
+        if any(name not in cache for name in names):
+            return 3
+
+        color = scaled_color(accent, percent)
         for name in names:
             entry = cache.get(name)
             if not entry or not entry.get("leds"):
@@ -263,6 +289,57 @@ def apply(percent: int, accent: str, names: list[str]) -> int:
     finally:
         sock.close()
     return 0
+
+
+def read_device(sock: socket.socket, device: int) -> bytes:
+    """Возвращает описание устройства целиком (как его отдаёт сервер)."""
+    body = read_until(sock, PACKET_REQUEST_CONTROLLER_DATA, 4.0)
+    if body is None:
+        return b""
+    return body[2]
+
+
+def verify(percent: int, accent: str, names: list[str], verbose: bool = False) -> int:
+    """Проверяет, что записанный цвет действительно лежит в железе.
+
+    Каналы в описании устройства хранятся в собственном порядке драйвера, а не
+    в том, что мы отправляли (у ASRock Polychrome USB порядок байт на светодиод
+    отличается от нашего). Поэтому ищем нужные три байта в любом порядке: так
+    проверка отвечает на вопрос "дошёл ли цвет", а не "совпали ли байты".
+    """
+    if not server_running():
+        return 3
+    color = scaled_color(accent, percent)
+    want = {bytes([color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF])}
+    red, green, blue = color & 0xFF, (color >> 8) & 0xFF, (color >> 16) & 0xFF
+    for order in itertools.permutations((red, green, blue)):
+        want.add(bytes(order))
+    sock = connect(4.0)
+    if sock is None:
+        return 3
+    ok = True
+    try:
+        cache = resolve(names, sock)
+        for name in names:
+            entry = cache.get(name)
+            if not entry or not entry.get("leds"):
+                continue
+            send(sock, entry["index"], PACKET_REQUEST_CONTROLLER_DATA)
+            body = read_device(sock, entry["index"])
+            hits = sum(
+                1
+                for offset in range(len(body) - 2)
+                if body[offset:offset + 3] in want
+            )
+            expected = entry["leds"]
+            matched = hits >= expected * 0.9
+            ok = ok and matched
+            if verbose or not matched:
+                print(f"{name}: {hits} совпадений из {expected} светодиодов "
+                      f"для #{red:02x}{green:02x}{blue:02x} — {'ок' if matched else 'НЕ СОВПАЛО'}")
+    finally:
+        sock.close()
+    return 0 if ok else 1
 
 
 def main(argv: list[str]) -> int:
@@ -281,6 +358,10 @@ def main(argv: list[str]) -> int:
         if not start_server():
             return 3
         return discover(argv[2:])
+    if action == "verify":
+        if len(argv) < 5:
+            return 2
+        return verify(int(float(argv[2])), argv[3], argv[4:])
     if action == "apply":
         if len(argv) < 5:
             return 2

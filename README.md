@@ -146,6 +146,18 @@ are fixed:
   The cooler screen's brightness goes over IPC, which never reaches the file, and
   the file is what the daemon applies when the hook restarts it.
 
+### The board is verified, not assumed
+
+`openrgb` exits 0 whether or not a colour reached anything, and a colour written
+through the SDK has to be confirmed against the device rather than the log. The
+helper can now read a device's own report back and count how many of its LEDs
+carry the colour we asked for (`bin/openrgb-fast.py verify <percent> <accent>
+<device>`), and the theme hook records the verdict. One subtlety this caught: the
+server's device indices are not stable — the board moved from index 4 to 3 when
+the server was restarted — so an index is now confirmed against the device's name
+before anything is written, and the cache is rebuilt when they disagree. Writing
+by a stale index paints the wrong device and leaves the right one untouched.
+
 ## Configure
 
 Device names for OpenRGB and the AIO's device ID are listed at the top of
