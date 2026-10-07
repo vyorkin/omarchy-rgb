@@ -263,6 +263,28 @@ lianli_lcd_brightness() {
 # intermediate levels turn into a single final one.
 OPENRGB_LOCK="${XDG_RUNTIME_DIR:-/tmp}/omarchy-rgb-openrgb.lock"
 
+# Быстрый путь: сервер OpenRGB держит устройства открытыми, и запись цвета уходит
+# за миллисекунды вместо трёх секунд опроса в CLI (см. bin/openrgb-fast.py).
+PLUGIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+OPENRGB_HELPER="$PLUGIN_DIR/bin/openrgb-fast.py"
+OPENRGB_CACHE="$STATE_DIR/openrgb-devices.json"
+
+openrgb_fast() {
+    local percent=$1
+    [[ -x $OPENRGB_HELPER ]] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    "$OPENRGB_HELPER" apply "$percent" "$(accent_hex)" "${OPENRGB_DEVICES[@]}" 2>/dev/null
+}
+
+# Сервер ещё не поднят — поднимаем его в фоне, чтобы следующее движение
+# ползунка уже не ждало нескольких секунд детекции.
+openrgb_warmup() {
+    [[ -x $OPENRGB_HELPER ]] || return 0
+    [[ -f $OPENRGB_CACHE ]] && return 0
+    ( "$OPENRGB_HELPER" warmup "${OPENRGB_DEVICES[@]}" >/dev/null 2>&1 & ) 2>/dev/null
+    return 0
+}
+
 # OpenRGB и яркость: у ASRock режим Static объявлен как
 # MODE_FLAG_HAS_PER_LED_COLOR без флага яркости, поэтому `-b` он игнорирует —
 # лента на ARGB-разъёме остаётся яркой. Яркость здесь тоже задаётся цветом:
@@ -376,8 +398,12 @@ apply_all() {
         state_mark_fast "$fast"
     fi
 
-    # Плата уезжает в фон: команда возвращается, не дожидаясь трёх секунд опроса.
-    openrgb_async "$generation"
+    # Плата: одна команда, когда сервер уже поднят. Если его нет — фоновый опрос
+    # CLI плюс подъём сервера для следующих движений ползунка.
+    if ! openrgb_fast "$percent"; then
+        openrgb_warmup
+        openrgb_async "$generation"
+    fi
     return 0
 }
 
