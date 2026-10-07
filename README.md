@@ -131,9 +131,15 @@ are fixed:
   and retries once, and a write that still fails is retried in the background
   until the daemon answers — but only while the value is still the current one, so
   a stale retry can never overwrite a newer level;
-- the theme hook does not race the daemon at all any more. It writes the
-  brightness-scaled colours and the cooler screen's level straight into the
-  configuration file, so the daemon reads the finished values when it starts;
+- the theme hook does not race the daemon at all any more, and it does not
+  restart it either. The colours and the screen template go over the daemon's
+  socket, so the pump and its fans change in about two seconds instead of waiting
+  for a restart and the fifteen seconds the cooler then needs to come up. The
+  configuration file is still written, for the case where the daemon is not
+  running;
+- the motherboard's mode is set once per boot rather than on every theme change.
+  Each mode write is visible as a flicker of the strip, and the mode itself -
+  Static - does not depend on the theme, so only the colour is written afterwards;
 - the level itself lives in `state.json`, which the hook reads before it touches
   anything, so the new theme's colours arrive at the brightness you chose - and a
   light you switched off stays off through a theme switch;
