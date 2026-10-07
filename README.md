@@ -204,6 +204,31 @@ order, and the lighting is the part you notice first. It keeps its own log in
 `~/.local/state/omarchy-rgb/sync.log`, which is what to read when a colour did not
 arrive.
 
+### When the two chains disagree
+
+If the lights on the board's ARGB headers and the Lian Li ones stop matching, find
+out what they were *told* before touching any script. Both chains should hold the
+same colour - the theme accent times the slider level:
+
+```sh
+python3 -c 'import json,os; c=json.load(open(os.path.expanduser("~/.config/lianli/config.json"))); print([z["effect"]["colors"][0] for d in c["rgb"]["devices"] for z in d.get("zones") or []])'
+```
+
+If the two are equal, the scripts are not at fault: the disagreement is either
+inside the LED controller or in the driver's own per-zone settings, and neither of
+those is a file this project owns. Restart the OpenRGB server and let the hook paint
+again:
+
+```sh
+for pid in $(pgrep -f "openrgb --serve[r]"); do kill "$pid"; done
+~/.local/bin/omarchy-rgb-sync
+```
+
+The driver re-applies its `RGSwap` settings for every header when it initialises,
+which is exactly what a stale controller state needs. That fixed a real divergence
+here, with no reboot involved. Check this before rewriting anything in the write
+path - doing it the other way round cost this project several hours.
+
 ## Configure
 
 Device names for OpenRGB and the AIO's device ID are listed at the top of
