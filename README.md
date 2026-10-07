@@ -120,6 +120,21 @@ The accent of the current Omarchy theme is the single source of that colour, the
 same one the theme hook writes. Per-zone colours set by hand in the Lian Li GUI
 are replaced by it whenever the slider moves.
 
+### Surviving a theme switch
+
+The theme hook restarts the Lian Li daemon, which then spends up to fifteen
+seconds bringing its RGB controller up. Two things followed from that, and both
+are fixed:
+
+- the widget writes through a cached `WriteGuard` and a long-lived socket; after
+  a restart both are stale, so a failed write now reconnects, refreshes the guard
+  and retries once, and a write that still fails is retried in the background
+  until the daemon answers — but only while the value is still the current one, so
+  a stale retry can never overwrite a newer level;
+- the theme hook does not race the daemon at all any more. It writes the
+  brightness-scaled colours and the cooler screen's level straight into the
+  configuration file, so the daemon reads the finished values when it starts.
+
 ## Configure
 
 Device names for OpenRGB and the AIO's device ID are listed at the top of

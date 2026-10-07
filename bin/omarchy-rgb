@@ -200,29 +200,54 @@ def make_guard():
 
 cached = read_json(guard_cache)
 guard = cached if cached.get("instance_id") else make_guard()
+failures = []
 if not guard:
     print("daemon did not answer")
     sys.exit(0)
 
-connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-connection.settimeout(6)
-try:
-    connection.connect(socket_path)
-except OSError as error:
-    print(f"cannot reach the daemon: {error}")
+def connect():
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(6)
+    try:
+        sock.connect(socket_path)
+    except OSError:
+        sock.close()
+        return None
+    return sock
+
+
+connection = connect()
+if connection is None:
+    print("cannot reach the daemon")
     sys.exit(0)
 
 
+def reconnect():
+    """Новое соединение и свежий guard: демон перезапускается при смене темы, и
+    старый сокет вместе с кэшированным guard после этого бесполезны."""
+    global connection, guard
+    try:
+        connection.close()
+    except OSError:
+        pass
+    connection = connect()
+    guard = make_guard() or guard
+    return connection is not None
+
+
 def write(request):
-    global guard
+    """Пишет запрос, а при устаревшем guard или мёртвом сокете пробует ещё раз."""
     response = call(request, connection)
-    if response.get("status") != "ok" and "daemon changed" in str(response.get("message", "")).lower():
-        renewed = make_guard()
-        if renewed:
-            guard = renewed
+    message = str(response.get("message", "")).lower()
+    if response.get("status") != "ok" and any(
+        marker in message for marker in ("daemon changed", "incompatible", "not found", "reach")
+    ):
+        if reconnect():
             response = call(request, connection)
+        message = str(response.get("message", "")).lower()
     if response.get("status") != "ok":
         print(response.get("message", "write rejected"))
+        failures.append(request)
     return response
 
 
@@ -266,9 +291,34 @@ write(guarded({
     "params": {"device_id": lcd_device, "brightness": percent},
 }))
 connection.close()
+# Ненулевой код велит оболочке повторить попытку в фоне: демон мог ещё
+# поднимать устройства после перезапуска.
+sys.exit(2 if failures else 0)
 INNER
 )
-    [[ -n $out ]] && log "Lian Li: $(printf '%s' "$out" | head -c 200)"
+    local status=$?
+    if [[ -n $out ]]; then
+        log "Lian Li: $(printf '%s' "$out" | head -c 200)"
+    fi
+    # Демон мог ещё поднимать RGB-контроллер после перезапуска: значение вернём
+    # позже. Повтор делаем только при реальной ошибке и только если к тому
+    # моменту не появилось более свежее значение — иначе он дописывал бы
+    # устаревшую яркость поверх новой.
+    # Демон после смены темы поднимает RGB-контроллер около пятнадцати секунд.
+    # В это окно запись не проходит, поэтому пробуем ещё несколько раз, пока
+    # значение в состоянии совпадает с нашим — иначе повод устарел.
+    if (( status != 0 )) && [[ ${OMARCHY_RGB_RETRY:-0} != 1 ]]; then
+        (
+            local delay
+            for delay in 3 7 12; do
+                sleep "$delay"
+                [[ "$(state_get fast_percent)" == "$percent" ]] || exit 0
+                if OMARCHY_RGB_RETRY=1 lianli_apply "$percent" >/dev/null 2>&1; then
+                    break
+                fi
+            done
+        ) &
+    fi
     return 0
 }
 
