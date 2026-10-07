@@ -133,7 +133,13 @@ are fixed:
   a stale retry can never overwrite a newer level;
 - the theme hook does not race the daemon at all any more. It writes the
   brightness-scaled colours and the cooler screen's level straight into the
-  configuration file, so the daemon reads the finished values when it starts.
+  configuration file, so the daemon reads the finished values when it starts;
+- the level itself lives in `state.json`, which the hook reads before it touches
+  anything, so the new theme's colours arrive at the brightness you chose - and a
+  light you switched off stays off through a theme switch.
+- the live level is written to the configuration file as well as to the device.
+  The cooler screen's brightness goes over IPC, which never reaches the file, and
+  the file is what the daemon applies when the hook restarts it.
 
 ## Configure
 

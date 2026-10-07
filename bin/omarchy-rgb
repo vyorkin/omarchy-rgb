@@ -344,6 +344,74 @@ INNER
     return 0
 }
 
+# Значение, которое должно стоять на зонах: масштабированный акцент темы.
+lianli_expected() {
+    python3 - "$(accent_hex)" "${1:-0}" <<'PY'
+import sys
+
+accent = sys.argv[1].lstrip("#")
+percent = max(0, min(100, int(float(sys.argv[2]))))
+red, green, blue = (int(accent[index:index + 2], 16) for index in (0, 2, 4))
+print(" ".join(str(round(channel * percent / 100)) for channel in (red, green, blue)))
+PY
+}
+
+# Проверяет по IPC, что на всех зонах стоит ожидаемый цвет.
+lianli_verify() {
+    local expected
+    expected=$(lianli_expected "${1:-0}")
+    python3 - "$LIANLI_SOCKET" "$expected" <<'PY'
+import json
+import socket
+import sys
+
+socket_path, expected = sys.argv[1], sys.argv[2]
+want = [int(part) for part in expected.split()]
+try:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(4)
+        sock.connect(socket_path)
+        sock.sendall(b'{"method":"GetConfig"}\n')
+        buf = b""
+        while b"\n" not in buf:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    config = json.loads(buf.decode())["data"]
+except Exception:
+    sys.exit(1)
+
+zones = [
+    zone
+    for device in config.get("rgb", {}).get("devices", [])
+    for zone in device.get("zones", [])
+]
+if not zones:
+    sys.exit(1)
+for zone in zones:
+    effect = zone.get("effect") or {}
+    colors = effect.get("colors") or [[-1, -1, -1]]
+    if colors[0][:3] != want:
+        sys.exit(1)
+sys.exit(0)
+PY
+}
+
+# Применяет уровень и добивается, чтобы он действительно оказался на зонах:
+# демон после смены темы поднимает устройства до пятнадцати секунд, а на
+# остановке перезаписывает файл конфигурации своей памятью.
+lianli_apply_confirmed() {
+    local percent=${1:-0} attempt
+    for attempt in $(seq 1 30); do
+        lianli_apply "$percent" >/dev/null 2>&1
+        lianli_verify "$percent" && return 0
+        sleep 1
+    done
+    log "Lian Li: уровень $percent% не подтвердился за 30 секунд"
+    return 1
+}
+
 # --- OpenRGB ------------------------------------------------------------------
 
 # Every `openrgb` run detects the whole machine again: about three seconds per
