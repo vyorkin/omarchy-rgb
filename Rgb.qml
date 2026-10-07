@@ -103,7 +103,7 @@ Panel {
   // which is why the state is not re-read on every step.
   Timer {
     id: liveApply
-    interval: 120
+    interval: 250
     repeat: false
     onTriggered: if (slider.dragging) root.pushBrightness(root.brightness, true)
   }

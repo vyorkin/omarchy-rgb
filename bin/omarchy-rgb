@@ -61,11 +61,33 @@ state_read() {
     fi
 }
 
+# Merges into the state file instead of rewriting it: the Lian Li helper keeps
+# its colour base in the same file and must not lose it on every slider move.
 state_write() {
-    local on=$1 brightness=$2
+    local on=$1 brightness=$2 generation
+    generation=$(date +%s%N)
     mkdir -p "$STATE_DIR"
-    printf '{"on":%s,"brightness":%s}\n' "$on" "$brightness" >"$STATE_FILE.tmp"
-    mv "$STATE_FILE.tmp" "$STATE_FILE"
+    python3 - "$STATE_FILE" "$on" "$brightness" "$generation" <<'PY'
+import json
+import os
+import sys
+
+path, on, brightness, generation = sys.argv[1:5]
+try:
+    with open(path, encoding="utf-8") as handle:
+        state = json.load(handle)
+except (OSError, ValueError):
+    state = {}
+state["on"] = on == "true"
+state["brightness"] = int(brightness)
+# Номер изменения: фоновый воркер по нему понимает, что за время его работы
+# появилось более свежее значение, и применяет новое вместо устаревшего.
+state["generation"] = generation
+with open(path + ".tmp", "w", encoding="utf-8") as handle:
+    json.dump(state, handle, ensure_ascii=False)
+os.replace(path + ".tmp", path)
+print(generation)
+PY
 }
 
 # --- Lian Li IPC --------------------------------------------------------------
@@ -75,34 +97,30 @@ state_write() {
 # refuses anonymous changes — so the helper asks for DaemonInfo first and wraps
 # every write. Reading the guard needs no privileges: it only pins the daemon
 # version and instance id.
+#
+# Brightness is applied through the colour, not the firmware level: that scale
+# has only five steps, so 3% would become 25% and stay bright. The widget keeps
+# the level at maximum and multiplies the zone colours instead, which gives a
+# percent-per-percent curve. The untouched colours are remembered per zone, so
+# the scaling never compounds, and a colour change made elsewhere (a theme
+# switch, the Lian Li GUI) becomes the new base.
 lianli_available() {
     [[ -S $LIANLI_SOCKET ]] && command -v python3 >/dev/null 2>&1
 }
 
-# Percent to the five levels the Lian Li firmware understands.
-level_for_percent() {
-    local percent=$1
-    if (( percent <= 0 )); then
-        echo 0
-    else
-        local level=$(( (percent * 4 + 99) / 100 ))
-        (( level < 1 )) && level=1
-        (( level > 4 )) && level=4
-        echo "$level"
-    fi
-}
-
-# lianli_send zones <level> <disabled> | lianli_send lcd <percent> false <device>
+# lianli_send zones <percent> | lianli_send lcd <percent> <device>
 lianli_send() {
     local action=${1:-zones}
     lianli_available || return 1
-    python3 - "$LIANLI_SOCKET" "$action" "${2:-0}" "${3:-false}" "${4:-}" <<'INNER'
+    python3 - "$LIANLI_SOCKET" "$STATE_FILE" "$action" "${2:-0}" "${3:-}" <<'INNER'
 import json
+import os
 import socket
 import sys
 
-socket_path, action, amount, flag, device = sys.argv[1:6]
-disabled = flag == "true"
+socket_path, state_path, action, amount, device = sys.argv[1:6]
+percent = max(0, min(100, int(float(amount))))
+disabled = percent <= 0
 
 
 def call(request):
@@ -150,7 +168,7 @@ def write(request):
 if action == "lcd":
     write({
         "method": "SetLcdBrightness",
-        "params": {"device_id": device, "brightness": int(amount)},
+        "params": {"device_id": device, "brightness": percent},
     })
     sys.exit(0)
 
@@ -159,33 +177,67 @@ if config.get("status") != "ok":
     print(config.get("message", "cannot read the daemon config"))
     sys.exit(0)
 
-rgb = (config["data"].get("rgb") or None)
+rgb = config["data"].get("rgb")
 if not rgb or not rgb.get("devices"):
     print("no RGB devices in the daemon config")
     sys.exit(0)
 
+
+def read_state():
+    try:
+        with open(state_path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+state = read_state()
+base = state.get("lianli_base") or {}
+sent = state.get("lianli_sent") or {}
+scale = percent / 100.0
+
 for device_entry in rgb.get("devices", []):
+    device_id = device_entry.get("device_id", "")
     for zone in device_entry.get("zones", []):
-        # Mode, colours and speed stay exactly as the theme sync left them: the
-        # widget only scales what is already there. The whole RGB config goes back
-        # in one SetRgbConfig call, which is the path the Lian Li GUI itself uses:
-        # it expands per-device scopes and regions correctly, while a raw
-        # SetRgbEffect would be rejected for devices like the Strimer whose
-        # effects are only valid in their own scope.
         effect = dict(zone.get("effect") or {})
-        effect["brightness"] = int(amount)
+        key = f"{device_id}:{zone.get('zone_index', 0)}"
+        current = [list(color) for color in (effect.get("colors") or [])]
+
+        # Что-то кроме нас поменяло цвет (тема, GUI) — принимаем это за основу.
+        if sent.get(key) != current:
+            base[key] = current
+        reference = base.get(key) or current or [[255, 255, 255]]
+        scaled = [
+            [max(0, min(255, round(channel * scale))) for channel in color]
+            for color in reference
+        ]
+
+        effect["colors"] = scaled
+        # Уровень держим максимальным: яркость задаётся цветом.
+        effect["brightness"] = 4 if percent > 0 else 0
         effect["disabled"] = disabled
         zone["effect"] = effect
+        sent[key] = scaled
 
+# Одна запись на все устройства: демон сам разворачивает области и регионы.
+# Сырой SetRgbEffect для лент не годится — он отвергает Static вне их области.
 write({"method": "SetRgbConfig", "params": {"config": rgb}})
+
+state["lianli_base"] = base
+state["lianli_sent"] = sent
+try:
+    os.makedirs(os.path.dirname(state_path), exist_ok=True)
+    with open(state_path + ".tmp", "w", encoding="utf-8") as handle:
+        json.dump(state, handle, ensure_ascii=False)
+    os.replace(state_path + ".tmp", state_path)
+except OSError as error:
+    print(f"cannot store scaling base: {error}")
 INNER
 }
 
 lianli_apply() {
-    local percent=$1 level
-    level=$(level_for_percent "$percent")
-    local out
-    out=$(lianli_send zones "$level" "$([[ $percent -le 0 ]] && echo true || echo false)")
+    local percent=$1 out
+    out=$(lianli_send zones "$percent")
     [[ -n $out ]] && log "Lian Li: $(printf '%s' "$out" | head -c 200)"
     return 0
 }
@@ -193,7 +245,7 @@ lianli_apply() {
 lianli_lcd_brightness() {
     local percent=$1 out
     [[ -S $LIANLI_SOCKET ]] || return 0
-    out=$(lianli_send lcd "$percent" false "$AIO_LCD_DEVICE")
+    out=$(lianli_send lcd "$percent" "$AIO_LCD_DEVICE")
     [[ -n $out ]] && log "Lian Li LCD: $(printf '%s' "$out" | head -c 200)"
     return 0
 }
@@ -242,10 +294,28 @@ openrgb_apply_state() {
 }
 
 openrgb_async() {
+    local spawn_generation=${1:-}
     command -v openrgb >/dev/null 2>&1 || return 0
     (
         flock 9 || exit 0
+
+        # Драгоценная пауза: пока предыдущий вызов дописывает плату, ползунок
+        # успевает уехать дальше, и почти все воркеры выйдут, так и не тронув
+        # железо. Без неё каждый промежуточный шаг перезаписывает ленту.
+        sleep 0.35
+
+        # Нас обогнали: ползунок уехал дальше, и свежий воркер применит новое
+        # значение. Работать здесь — это ещё одна перезапись платы, а каждая
+        # такая перезапись видна как короткое мигание ленты.
+        local current applied
+        current=$(read_state_field generation)
+        [[ -n $spawn_generation && -n $current && $spawn_generation != "$current" ]] && exit 0
+
+        applied=$(read_state_field openrgb_applied)
+        [[ -n $current && $current == "$applied" ]] && exit 0
+
         openrgb_apply_state
+        state_mark_applied "$current"
     ) 9>>"$OPENRGB_LOCK" &
 }
 
@@ -260,19 +330,64 @@ bezel_apply() {
 # --- commands -----------------------------------------------------------------
 
 apply_all() {
-    local percent=$1
-    local pids=()
+    local on=$1 brightness=$2 generation=${3:-}
+    local percent=$brightness
+    (( percent < 0 )) && percent=0
 
-    # Быстрые цели — сразу и параллельно: именно их задержку видно глазом.
-    lianli_apply "$percent" & pids+=($!)
-    lianli_lcd_brightness "$percent" & pids+=($!)
-    bezel_apply "$percent" & pids+=($!)
-    for pid in "${pids[@]}"; do wait "$pid"; done
+    # Шаг 5% для быстрых целей: ленты и экраны получают заметно меньше
+    # перерисовок, а глаз разницы между 40% и 42% всё равно не видит. Плата ниже
+    # берёт точное значение — она и так применяется в фоне.
+    # Мелкие значения не округляем: 3% должны остаться 3%, а не превратиться
+    # в 5% — именно на низах шаг заметнее всего.
+    local fast
+    if (( percent <= 10 )); then
+        fast=$percent
+    else
+        fast=$(( (percent + 2) / 5 * 5 ))
+        (( fast > 100 )) && fast=100
+    fi
+    (( percent == 0 )) && fast=0
+
+    local last_fast
+    last_fast=$(read_state_field fast_percent)
+    if [[ $last_fast != "$fast" || ${OMARCHY_RGB_FORCE:-0} == 1 ]]; then
+        local pids=()
+        lianli_apply "$fast" & pids+=($!)
+        lianli_lcd_brightness "$fast" & pids+=($!)
+        bezel_apply "$fast" & pids+=($!)
+        for pid in "${pids[@]}"; do wait "$pid"; done
+        state_mark_fast "$fast"
+    fi
 
     # Плата уезжает в фон: команда возвращается, не дожидаясь трёх секунд опроса.
-    openrgb_async
+    openrgb_async "$generation"
     return 0
 }
+
+state_set() {
+    python3 - "$STATE_FILE" "$1" "${2:-}" <<'PY'
+import json
+import os
+import sys
+
+path, key, raw = sys.argv[1:4]
+try:
+    with open(path, encoding="utf-8") as handle:
+        state = json.load(handle)
+except (OSError, ValueError):
+    state = {}
+try:
+    state[key] = json.loads(raw)
+except ValueError:
+    state[key] = raw
+with open(path + ".tmp", "w", encoding="utf-8") as handle:
+    json.dump(state, handle, ensure_ascii=False)
+os.replace(path + ".tmp", path)
+PY
+}
+
+state_mark_applied() { state_set openrgb_applied "${1:-}"; }
+state_mark_fast() { state_set fast_percent "${1:-}"; }
 
 read_state_field() {
     python3 - "$(state_read)" "$1" <<'PY'
@@ -318,19 +433,34 @@ cmd_set() {
     [[ $percent =~ ^[0-9]+$ ]] || die "яркость должна быть целым числом 0..100"
     (( percent >= 0 && percent <= 100 )) || die "яркость должна быть 0..100"
 
+    local on=true
     if (( percent <= 0 )); then
+        on=false
         # Off keeps the previous level, so `on` has something to restore.
         local last
         last=$(read_state_field brightness)
         [[ -n $last && $last != 0 ]] || last=100
-        state_write false "$last"
+        brightness=$last
     else
-        state_write true "$percent"
+        brightness=$percent
+    fi
+
+    # Ничего не изменилось — не трогаем железо вовсе: повторная запись того же
+    # значения заставляет ленты и плату перерисоваться, и это видно.
+    if [[ ${OMARCHY_RGB_FORCE:-0} != 1 ]]; then
+        local was_on was_brightness
+        was_on=$(read_state_field on)
+        was_brightness=$(read_state_field brightness)
+        if [[ ${was_on:-true} == "$on" && ${was_brightness:-} == "$brightness" ]]; then
+            return 0
+        fi
     fi
 
     # Состояние записано до запуска работ: фоновый OpenRGB-воркер читает именно
     # его, поэтому при перетаскивании ползунка применяется последнее значение.
-    apply_all "$percent"
+    local generation
+    generation=$(state_write "$on" "$brightness")
+    apply_all "$on" "$brightness" "$generation"
 }
 
 cmd_on() {
