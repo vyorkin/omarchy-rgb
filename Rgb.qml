@@ -24,6 +24,7 @@ Panel {
 
   property bool lightsOn: true
   property int brightness: 100
+  property int screenBrightness: 100
   property bool busy: false
   property string errorText: ""
 
@@ -65,6 +66,7 @@ Panel {
           var state = JSON.parse(text)
           root.lightsOn = state.on === true
           root.brightness = Number(state.brightness)
+          root.screenBrightness = state.lcd === undefined ? 100 : Number(state.lcd)
           root.errorText = ""
         } catch (error) {
           root.errorText = "cannot read state"
@@ -115,6 +117,22 @@ Panel {
       if (percent > 0) brightness = percent
     }
     run([root.cli, "set", String(percent)])
+  }
+
+  // The cooler's screen has its own backlight and its own slider: it is a
+  // different device from the lights, and dimming the strips should not dim it.
+  Timer {
+    id: liveScreenApply
+    interval: 250
+    repeat: false
+    onTriggered: if (screenSlider.dragging)
+      run([root.cli, "lcd", String(root.screenBrightness)])
+  }
+
+  function pushScreen(percent, live) {
+    percent = Math.max(0, Math.min(100, Math.round(percent)))
+    if (!live) screenBrightness = percent
+    run([root.cli, "lcd", String(percent)])
   }
 
   function refresh() {
@@ -243,6 +261,7 @@ Panel {
           }
         }
 
+
         PanelSeparator { foreground: root.textColor }
 
         PanelSlider {
@@ -268,6 +287,48 @@ Panel {
           onRightClicked: root.toggleAll()
         }
 
+        PanelSeparator { foreground: root.textColor }
+
+        RowLayout {
+          width: parent.width
+          spacing: Style.spacing.controlGap
+
+          PanelSectionHeader {
+            text: "Screen"
+            foreground: root.textColor
+          }
+
+          Item { Layout.fillWidth: true }
+
+          Text {
+            text: root.screenBrightness + "%"
+            color: root.dimText
+            font.family: Style.font.family
+            font.pixelSize: Style.font.bodySmall
+            textFormat: Text.PlainText
+          }
+        }
+
+        PanelSlider {
+          id: screenSlider
+          bar: root.bar
+          width: parent.width
+          minimum: 0
+          maximum: 100
+          step: 1
+          integer: true
+          value: root.screenBrightness
+
+          onMoved: function(value) {
+            root.screenBrightness = Math.round(value)
+            liveScreenApply.restart()
+          }
+          onReleased: function(value) {
+            liveScreenApply.stop()
+            root.pushScreen(value, false)
+          }
+        }
+
         Text {
           width: parent.width
           visible: root.errorText !== ""
@@ -281,7 +342,7 @@ Panel {
 
         Text {
           width: parent.width
-          text: "Lights, pump, strips and both screens. RAM is left alone."
+          text: "Lights, pump, strips and the case panel. The cooler's screen has its own backlight above. RAM is left alone."
           color: root.dimText
           wrapMode: Text.WordWrap
           font.family: Style.font.family

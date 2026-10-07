@@ -229,6 +229,19 @@ which is exactly what a stale controller state needs. That fixed a real divergen
 here, with no reboot involved. Check this before rewriting anything in the write
 path - doing it the other way round cost this project several hours.
 
+### Two sliders
+
+The popup has one slider for the lighting and one for the cooler's 480x480 screen,
+because they are different devices and dimming the strips should not dim the screen.
+The screen's value lives in `lcd_brightness` beside the level, and the theme hook
+reads it, so a theme switch no longer resets it.
+
+The screen's brightness has to go through `SetConfig`, not `SetLcdBrightness`. The
+latter changes the screen but leaves the daemon's own copy of the LCD settings
+alone, so the daemon put its stale value back at the first save - which is why the
+screen used to ignore the slider entirely. `SetConfig` carries the screen's settings
+with it and updates both. The 8.8" case panel still follows the lighting slider.
+
 ## Configure
 
 Device names for OpenRGB and the AIO's device ID are listed at the top of

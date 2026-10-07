@@ -443,12 +443,21 @@ fi
 gen_lianli() {
     # $1 = check | apply. В режиме check файлы не пишутся, только отчёт:
     # так демон останавливается лишь когда есть что менять.
-    python3 - "$1" "$LIANLI_CFG" "$LIANLI_TPL" "$accent" "$background" "$color2" "$color4" "$color6" "$color7" "$family" "$rgb_level" <<'PY'
+    python3 - "$1" "$LIANLI_CFG" "$LIANLI_TPL" "$accent" "$background" "$color2" "$color4" "$color6" "$color7" "$family" "$rgb_level" \
+        "${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-rgb/state.json" <<'PY'
 import json, os, sys
 
 mode, cfg_path, tpl_path = sys.argv[1], sys.argv[2], sys.argv[3]
-accent, background, c2, c4, c6, c7, family, level_raw = sys.argv[4:12]
+accent, background, c2, c4, c6, c7, family, level_raw, state_path = sys.argv[4:13]
 level = max(0, min(100, int(level_raw)))
+# Яркость экрана водянки плагин хранит отдельно, в своём состоянии (поле
+# lcd_brightness): у неё свой ползунок, и смена темы не должна её сбрасывать.
+lcd_level = level
+try:
+    with open(state_path, encoding="utf-8") as handle:
+        lcd_level = max(0, min(100, int(json.load(handle).get("lcd_brightness", level))))
+except (OSError, ValueError, TypeError):
+    lcd_level = level
 scale = level / 100.0
 apply = mode == "apply"
 
@@ -487,7 +496,9 @@ if os.path.exists(cfg_path):
             # мельтешение.
             effect["speed"] = 0
     for entry in cfg.get("lcds") or []:
-        entry["brightness"] = level
+        # Яркость экрана — своя величина со своим ползунком в плагине. Раньше
+        # сюда попадал уровень подсветки, и смена темы сбрасывала яркость экрана.
+        entry["brightness"] = lcd_level
     if json.dumps(cfg, sort_keys=True, ensure_ascii=False) != before:
         state["config"] = True
         if apply:

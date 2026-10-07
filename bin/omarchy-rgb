@@ -15,6 +15,7 @@
 # Commands:
 #   omarchy-rgb status [--json]   print the current state
 #   omarchy-rgb set <0..100>      set every light to a percentage
+#   omarchy-rgb lcd <0..100>      backlight of the cooler's screen
 #   omarchy-rgb on                restore the last non-zero brightness
 #   omarchy-rgb off               turn everything off, remembering the level
 #   omarchy-rgb toggle            off when anything is on, on otherwise
@@ -61,7 +62,7 @@ STATE_FILE="$STATE_DIR/state.json"
 LIANLI_COLORS="$STATE_DIR/lianli-colors.json"
 GUARD_CACHE="$STATE_DIR/lianli-guard.json"
 
-state_default() { printf '{"on":true,"brightness":100,"generation":0,"fast_percent":-1}'; }
+state_default() { printf '{"on":true,"brightness":100,"generation":0,"fast_percent":-1,"lcd_brightness":100}'; }
 
 state_read() {
     if [[ -r $STATE_FILE ]]; then cat "$STATE_FILE"; else state_default; fi
@@ -91,13 +92,17 @@ state_mark_fast() { shift_state_field fast_percent "${1:-0}"; }
 
 # state_write <on> <brightness> — печатает номер изменения.
 state_write() {
-    local on=$1 brightness=$2 generation previous_fast
+    local on=$1 brightness=$2 generation previous_fast previous_lcd
     generation=$(date +%s%N)
     previous_fast=$(state_get fast_percent)
     [[ $previous_fast =~ ^-?[0-9]+$ ]] || previous_fast=-1
+    # Яркость экрана живёт в состоянии отдельно от яркости подсветки: её задаёт
+    # свой ползунок, и перезапись состояния не должна её терять.
+    previous_lcd=$(state_get lcd_brightness)
+    [[ $previous_lcd =~ ^[0-9]+$ ]] || previous_lcd=100
     mkdir -p "$STATE_DIR"
-    printf '{"on":%s,"brightness":%s,"generation":"%s","fast_percent":%s}\n' \
-        "$on" "$brightness" "$generation" "$previous_fast" >"$STATE_FILE.tmp"
+    printf '{"on":%s,"brightness":%s,"generation":"%s","fast_percent":%s,"lcd_brightness":%s}\n' \
+        "$on" "$brightness" "$generation" "$previous_fast" "$previous_lcd" >"$STATE_FILE.tmp"
     mv "$STATE_FILE.tmp" "$STATE_FILE"
     printf '%s' "$generation"
 }
@@ -124,19 +129,23 @@ lianli_available() {
 }
 
 # lianli_apply <percent>
+# lianli_apply <процент подсветки|пусто> [процент яркости экрана] [только экран]
 lianli_apply() {
-    local percent=${1:-0} out
+    local percent=${1:-0} lcd_percent=${2:-} skip_rgb=${3:-0} out
     lianli_available || return 0
     [[ $percent =~ ^[0-9]+$ ]] || percent=0
     out=$(python3 - "$LIANLI_SOCKET" "$LIANLI_COLORS" "$percent" "$(accent_hex)" \
-        "$GUARD_CACHE" "$AIO_LCD_DEVICE" "${XDG_CONFIG_HOME:-$HOME/.config}/lianli/config.json" <<'INNER'
+        "$GUARD_CACHE" "$AIO_LCD_DEVICE" "${XDG_CONFIG_HOME:-$HOME/.config}/lianli/config.json" \
+        "$lcd_percent" "$skip_rgb" <<'INNER'
 import json
 import os
 import socket
 import sys
 
 socket_path, colors_path, percent_raw, accent, guard_cache, lcd_device, config_path = sys.argv[1:8]
+lcd_raw, skip_rgb = sys.argv[8], sys.argv[9] == "1"
 percent = max(0, min(100, int(float(percent_raw))))
+lcd_percent = max(0, min(100, int(float(lcd_raw)))) if lcd_raw.strip() else None
 accent = accent.lstrip("#")
 
 
@@ -265,7 +274,7 @@ rgb = config["data"].get("rgb")
 accent_rgb = [int(accent[index:index + 2], 16) for index in (0, 2, 4)]
 scale = percent / 100.0
 
-if rgb and rgb.get("devices"):
+if not skip_rgb and rgb and rgb.get("devices"):
     for device_entry in rgb.get("devices", []):
         device_id = device_entry.get("device_id", "")
         for zone in device_entry.get("zones", []):
@@ -286,31 +295,16 @@ if rgb and rgb.get("devices"):
     # Сырой SetRgbEffect для лент не годится — он отвергает Static вне их области.
     write(guarded({"method": "SetRgbConfig", "params": {"config": rgb}}))
 
-write(guarded({
-    "method": "SetLcdBrightness",
-    "params": {"device_id": lcd_device, "brightness": percent},
-}))
-
-# Демон при следующем запуске берёт яркость экрана из файла конфигурации, а живая
-# запись по IPC в файл не попадает. Держим их согласованными, иначе после смены
-# темы (демон перезапускается) яркость откатывается к прежней.
-try:
-    with open(config_path, encoding="utf-8") as handle:
-        on_disk = json.load(handle)
-except (OSError, ValueError):
-    on_disk = None
-if on_disk is not None:
-    changed = False
-    for entry in on_disk.get("lcds") or []:
-        if entry.get("brightness") != percent:
-            entry["brightness"] = percent
-            changed = True
-    if changed:
-        try:
-            with open(config_path, "w", encoding="utf-8") as handle:
-                json.dump(on_disk, handle, ensure_ascii=False, indent=2)
-        except OSError as error:
-            print(f"cannot update {config_path}: {error}")
+# Яркость экрана водянки — отдельная величина со своим ползунком, поэтому
+# трогаем её только когда её передали явно. Записываем её через SetConfig, а не
+# через SetLcdBrightness: только он меняет и память демона. С SetLcdBrightness
+# экран гас и загорался, но память оставалась прежней, и демон возвращал своё
+# значение при первой же своей записи — из-за этого яркость «не держалась».
+if lcd_percent is not None:
+    whole = config.get("data") or {}
+    for entry in whole.get("lcds") or []:
+        entry["brightness"] = lcd_percent
+    write(guarded({"method": "SetConfig", "params": {"config": whole}}))
 
 connection.close()
 # Ненулевой код велит оболочке повторить попытку в фоне: демон мог ещё
@@ -652,19 +646,21 @@ PY
 cmd_status() {
     local json=0
     [[ ${1:-} == --json ]] && json=1
-    local on brightness accent
+    local on brightness accent lcd
     on=$(state_get on)
     brightness=$(state_get brightness)
+    lcd=$(state_get lcd_brightness)
     [[ -n $on ]] || on=true
     [[ -n $brightness ]] || brightness=100
+    [[ -n $lcd ]] || lcd=100
     accent=$(accent_hex)
     if (( json )); then
-        printf '{"on":%s,"brightness":%s,"accent":"%s"}\n' "$on" "$brightness" "$accent"
+        printf '{"on":%s,"brightness":%s,"lcd":%s,"accent":"%s"}\n' "$on" "$brightness" "$lcd" "$accent"
     else
         if [[ $on == true ]]; then
-            printf 'lights on, %s%%, accent %s\n' "$brightness" "$accent"
+            printf 'lights on, %s%%, screen %s%%, accent %s\n' "$brightness" "$lcd" "$accent"
         else
-            printf 'lights off (last level %s%%)\n' "$brightness"
+            printf 'lights off (last level %s%%, screen %s%%)\n' "$brightness" "$lcd"
         fi
     fi
 }
@@ -701,7 +697,39 @@ cmd_set() {
     # его, поэтому при перетаскивании ползунка применяется последнее значение.
     local generation
     generation=$(state_write "$on" "$brightness")
+    # Экран трогаем только при переходе между включено и выключено: у него своя
+    # яркость и свой ползунок, и дёргать его на каждом шаге подсветки не нужно.
+    if [[ ${was_on:-true} != "$on" ]]; then
+        local lcd_target
+        lcd_target=$(state_get lcd_brightness)
+        [[ $lcd_target =~ ^[0-9]+$ ]] || lcd_target=100
+        # Сравнение строкой: при set -u арифметика пытается разыменовать слово
+        # "false" как переменную и падает.
+        [[ $on == false ]] && lcd_target=0
+        lianli_apply "" "$lcd_target" 1 >/dev/null 2>&1 &
+    fi
     apply_all "$on" "$brightness" "$generation"
+}
+
+# Яркость экрана водянки: своя величина, отдельная от подсветки. Экран живёт на
+# том же демоне, поэтому пишем по IPC, а значение держим в состоянии — им же
+# пользуется хук темы, чтобы смена темы не сбрасывала яркость.
+cmd_lcd() {
+    local percent=${1:-}
+    [[ $percent =~ ^[0-9]+$ ]] || die "яркость экрана должна быть целым числом 0..100"
+    (( percent >= 0 && percent <= 100 )) || die "яркость экрана должна быть 0..100"
+
+    if [[ ${OMARCHY_RGB_FORCE:-0} != 1 ]]; then
+        local was
+        was=$(state_get lcd_brightness)
+        [[ $was == "$percent" ]] && return 0
+    fi
+
+    shift_state_field lcd_brightness "$percent"
+    # В фоне: запись по IPC иногда ждёт подтверждения демона до нескольких
+    # секунд, и интерфейс из-за этого дёргаться не должен.
+    lianli_apply "" "$percent" 1 >/dev/null 2>&1 &
+    return 0
 }
 
 cmd_on() {
@@ -723,6 +751,7 @@ cmd_toggle() {
 case "${1:-status}" in
     status) shift || true; cmd_status "${1:-}" ;;
     set) shift || true; cmd_set "${1:-}" ;;
+    lcd) shift || true; cmd_lcd "${1:-}" ;;
     on) cmd_on ;;
     off) cmd_off ;;
     toggle) cmd_toggle ;;
