@@ -136,7 +136,12 @@ are fixed:
   configuration file, so the daemon reads the finished values when it starts;
 - the level itself lives in `state.json`, which the hook reads before it touches
   anything, so the new theme's colours arrive at the brightness you chose - and a
-  light you switched off stays off through a theme switch.
+  light you switched off stays off through a theme switch;
+- the motherboard and the graphics card are painted by the same code path as the
+  slider, not only by the `openrgb` command line. The ASRock driver stores a
+  per-LED colour with its red and blue channels swapped for Static mode, so a
+  colour written by the two paths differently shows up as a different hue; going
+  through the SDK keeps the theme hook and the slider in agreement.
 - the live level is written to the configuration file as well as to the device.
   The cooler screen's brightness goes over IPC, which never reaches the file, and
   the file is what the daemon applies when the hook restarts it.
