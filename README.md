@@ -79,6 +79,24 @@ bin/omarchy-rgb accent          # the accent colour of the current Omarchy theme
 State lives in `${XDG_STATE_HOME:-~/.local/state}/omarchy-rgb/state.json`, so
 `on` can restore the level you were at before switching everything off.
 
+## Latency
+
+`openrgb` detects the whole machine on every run — about three seconds per
+device — so waiting for it made the slider feel dead. The script therefore
+applies the fast targets first, in parallel, and hands the board to a detached
+worker:
+
+| Target | Time to apply |
+|---|---|
+| Lian Li devices (socket) | ~50 ms |
+| Cooler screen backlight | ~50 ms |
+| 8.8" panel (`bezel`) | ~16 ms |
+| Motherboard and graphics card | a few seconds, in the background |
+
+The worker takes a lock and reads the current state when it gets it, so a drag
+collapses into one write instead of twenty. The widget pushes the level while
+you drag, throttled to 120 ms, and does not re-read the state on every step.
+
 ## Configure
 
 Device names for OpenRGB and the AIO's device ID are listed at the top of

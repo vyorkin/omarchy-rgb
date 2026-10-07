@@ -200,11 +200,19 @@ lianli_lcd_brightness() {
 
 # --- OpenRGB ------------------------------------------------------------------
 
-openrgb_apply() {
-    local percent=$1
-    command -v openrgb >/dev/null 2>&1 || return 0
+# Every `openrgb` run detects the whole machine again: about three seconds per
+# device, and the two devices are applied one after the other. Doing that while
+# the user waits is what made the slider feel dead, so the work is handed to a
+# detached worker: the fast targets (Lian Li, the cooler screen, the case panel)
+# answer in tens of milliseconds and the board catches up in the background.
+#
+# A lock makes a drag collapse into one write: the worker reads the *current*
+# state when it gets the lock, not the value it was started with, so twenty
+# intermediate levels turn into a single final one.
+OPENRGB_LOCK="${XDG_RUNTIME_DIR:-/tmp}/omarchy-rgb-openrgb.lock"
 
-    local accent device
+openrgb_render() {
+    local percent=$1 accent device
     accent=$(accent_hex)
     for device in "${OPENRGB_DEVICES[@]}"; do
         if (( percent <= 0 )); then
@@ -220,6 +228,27 @@ openrgb_apply() {
     done
 }
 
+openrgb_apply_state() {
+    local on brightness
+    on=$(read_state_field on)
+    brightness=$(read_state_field brightness)
+    [[ -n $on ]] || on=true
+    [[ -n $brightness ]] || brightness=100
+    if [[ $on == false || $brightness == 0 ]]; then
+        openrgb_render 0
+    else
+        openrgb_render "$brightness"
+    fi
+}
+
+openrgb_async() {
+    command -v openrgb >/dev/null 2>&1 || return 0
+    (
+        flock 9 || exit 0
+        openrgb_apply_state
+    ) 9>>"$OPENRGB_LOCK" &
+}
+
 # --- 8.8" panel ---------------------------------------------------------------
 
 bezel_apply() {
@@ -232,10 +261,16 @@ bezel_apply() {
 
 apply_all() {
     local percent=$1
-    openrgb_apply "$percent"
-    lianli_apply "$percent" || true
-    lianli_lcd_brightness "$percent" || true
-    bezel_apply "$percent"
+    local pids=()
+
+    # Быстрые цели — сразу и параллельно: именно их задержку видно глазом.
+    lianli_apply "$percent" & pids+=($!)
+    lianli_lcd_brightness "$percent" & pids+=($!)
+    bezel_apply "$percent" & pids+=($!)
+    for pid in "${pids[@]}"; do wait "$pid"; done
+
+    # Плата уезжает в фон: команда возвращается, не дожидаясь трёх секунд опроса.
+    openrgb_async
     return 0
 }
 
@@ -283,7 +318,6 @@ cmd_set() {
     [[ $percent =~ ^[0-9]+$ ]] || die "яркость должна быть целым числом 0..100"
     (( percent >= 0 && percent <= 100 )) || die "яркость должна быть 0..100"
 
-    apply_all "$percent"
     if (( percent <= 0 )); then
         # Off keeps the previous level, so `on` has something to restore.
         local last
@@ -293,6 +327,10 @@ cmd_set() {
     else
         state_write true "$percent"
     fi
+
+    # Состояние записано до запуска работ: фоновый OpenRGB-воркер читает именно
+    # его, поэтому при перетаскивании ползунка применяется последнее значение.
+    apply_all "$percent"
 }
 
 cmd_on() {

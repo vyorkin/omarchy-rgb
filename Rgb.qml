@@ -45,6 +45,10 @@ Panel {
 
   Component.onCompleted: refresh()
 
+  // Re-read the real state whenever the popup opens: the theme hook or another
+  // terminal session may have changed it since the widget last looked.
+  onOpenedChanged: if (root.opened) root.refresh()
+
   // ------------------------------------------------------------------ backend ---
 
   // Status is read on demand rather than polled: nothing changes the level
@@ -93,16 +97,29 @@ Panel {
     process.running = true
   }
 
+  // Brightness is pushed while the slider moves, throttled: the CLI applies the
+  // visible targets in tens of milliseconds, so the light follows the hand
+  // instead of waiting for the drag to end. The board lags in the background,
+  // which is why the state is not re-read on every step.
+  Timer {
+    id: liveApply
+    interval: 120
+    repeat: false
+    onTriggered: if (slider.dragging) root.pushBrightness(root.brightness, true)
+  }
+
+  function pushBrightness(percent, live) {
+    percent = Math.max(0, Math.min(100, Math.round(percent)))
+    if (!live) {
+      lightsOn = percent > 0
+      if (percent > 0) brightness = percent
+    }
+    run([root.cli, "set", String(percent)])
+  }
+
   function refresh() {
     if (statusProcess.running) return
     statusProcess.running = true
-  }
-
-  function applyBrightness(percent) {
-    percent = Math.max(0, Math.min(100, Math.round(percent)))
-    brightness = percent === 0 ? brightness : percent
-    lightsOn = percent > 0
-    run([root.cli, "set", String(percent)], function() { refresh() })
   }
 
   function toggleAll() {
@@ -111,8 +128,8 @@ Panel {
   }
 
   function nudge(delta) {
-    if (!lightsOn && delta > 0) { applyBrightness(brightness); return }
-    applyBrightness(brightness + delta)
+    if (!lightsOn && delta > 0) { pushBrightness(brightness, false); return }
+    pushBrightness(brightness + delta, false)
   }
 
   // ---------------------------------------------------------------------- bar ---
@@ -239,8 +256,15 @@ Panel {
           value: root.lightsOn ? root.brightness : 0
           opacity: root.lightsOn ? 1.0 : 0.45
 
-          onMoved: function(value) { root.brightness = Math.round(value) }
-          onReleased: function(value) { root.applyBrightness(value) }
+          onMoved: function(value) {
+            root.brightness = Math.round(value)
+            if (value > 0) root.lightsOn = true
+            liveApply.restart()
+          }
+          onReleased: function(value) {
+            liveApply.stop()
+            root.pushBrightness(value, false)
+          }
           onRightClicked: root.toggleAll()
         }
 
