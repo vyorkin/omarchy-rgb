@@ -164,6 +164,33 @@ the server was restarted — so an index is now confirmed against the device's n
 before anything is written, and the cache is rebuilt when they disagree. Writing
 by a stale index paints the wrong device and leaves the right one untouched.
 
+## The theme hook
+
+`bin/omarchy-rgb-sync` makes the lights and both screens follow the Omarchy theme.
+It reads the staged palette, applies the colours to the Lian Li daemon over its
+socket (no restart: the daemon would otherwise spend fifteen seconds bringing its
+RGB controller up), writes the motherboard's colour as its *mode* colour - one
+writer only, because the hardware keeps the mode colour and the per-LED array
+apart and shows whichever was written last - and regenerates the 8.8" panel theme.
+
+Install it as a hook, once, with a wrapper so the real script stays in one place:
+
+```sh
+printf '#!/usr/bin/env bash
+exec "$HOME/.local/bin/omarchy-rgb-sync" "${1:-}"
+' \
+  > ~/.config/omarchy/hooks/theme-set.d/00-omarchy-rgb-sync
+cp ~/.config/omarchy/hooks/theme-set.d/00-omarchy-rgb-sync \
+   ~/.config/omarchy/hooks/post-boot.d/00-omarchy-rgb-sync
+chmod +x ~/.config/omarchy/hooks/theme-set.d/00-omarchy-rgb-sync \
+         ~/.config/omarchy/hooks/post-boot.d/00-omarchy-rgb-sync
+```
+
+The name starts with `00-` on purpose: the theme engine runs the hooks in name
+order, and the lighting is the part you notice first. It keeps its own log in
+`~/.local/state/omarchy-rgb/sync.log`, which is what to read when a colour did not
+arrive.
+
 ## Configure
 
 Device names for OpenRGB and the AIO's device ID are listed at the top of

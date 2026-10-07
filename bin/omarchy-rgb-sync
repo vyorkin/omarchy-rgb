@@ -1,0 +1,579 @@
+#!/usr/bin/env bash
+# Приводит подсветку и оба экрана к текущей теме Omarchy.
+#
+# Что делает:
+#   1. OpenRGB  — ARGB-разъёмы платы и подсветка видеокарты красятся в accent темы;
+#   2. Lian Li  — подсветка помпы AIO и цвета шаблона экрана 480x480 берутся из палитры;
+#   3. bezel    — тема панели 8.8" генерируется заново из шаблона Midnight.
+#
+# Ставится хук-скриптом в ~/.config/omarchy/hooks/theme-set.d (при смене темы)
+# и в post-boot.d (при каждом входе). Имя темы приходит в $1, но цвета всегда
+# читаются из staged-палитры, поэтому скрипт одинаково работает из обоих хуков.
+#
+# Повторный запуск без изменений ничего не перезапускает: сначала считаем новое
+# состояние в память, сравниваем с файлами и трогаем сервисы только при разнице.
+
+set -euo pipefail
+
+THEME_NAME="${1:-$(omarchy-theme-current 2>/dev/null || echo unknown)}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/current/theme"
+COLORS="$STATE_DIR/colors.toml"
+CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+LIANLI_CFG="$CONFIG_HOME/lianli/config.json"
+LIANLI_TPL="$CONFIG_HOME/lianli/lcd_templates.json"
+BEZEL_THEMES="$DATA_HOME/bezel/themes"
+BEZEL_SRC="$BEZEL_THEMES/turing-8.8-vertical"
+BEZEL_OUT="$BEZEL_THEMES/omarchy-8.8"
+BEZEL_UNIT="bezel-run@omarchy-8.8"
+LIANLI_UNIT="lianli-daemon.service"
+
+# Журнал рядом с состоянием плагина: смену темы запускает не человек, и без
+# записи потом не видно, какую палитру хук прочитал и что успел записать.
+STATE_DIR_RGB="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-rgb"
+LOG_DIR="$STATE_DIR_RGB"
+LOG_FILE="$LOG_DIR/sync.log"
+log() {
+    printf 'rgb-sync: %s\n' "$*"
+    mkdir -p "$LOG_DIR" 2>/dev/null || return 0
+    printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG_FILE" 2>/dev/null || true
+    # Держим журнал коротким: он нужен только для последних переключений.
+    if [[ $(wc -l < "$LOG_FILE" 2>/dev/null || echo 0) -gt 400 ]]; then
+        tail -n 200 "$LOG_FILE" > "$LOG_FILE.tmp" 2>/dev/null && mv "$LOG_FILE.tmp" "$LOG_FILE"
+    fi
+}
+die() { printf 'rgb-sync: %s\n' "$*" >&2; exit 0; }
+
+[[ -r $COLORS ]] || die "нет палитры $COLORS, пропускаю"
+
+c() { omarchy-theme-color --file "$COLORS" "$1" 2>/dev/null | tr -d '"' || true; }
+
+# Палитра темы. Каждый ключ обязан быть валидным #rrggbb.
+accent=$(c accent); background=$(c background); foreground=$(c foreground)
+color2=$(c color2); color3=$(c color3); color4=$(c color4)
+color5=$(c color5); color6=$(c color6); color7=$(c color7); color8=$(c color8)
+
+for v in accent background foreground color2 color3 color4 color5 color6 color7 color8; do
+    val="${!v}"
+    [[ $val =~ ^#[0-9a-fA-F]{6}$ ]] || die "тема '$THEME_NAME' не дала цвет $v ('$val')"
+done
+
+log "тема '$THEME_NAME': accent=$accent background=$background"
+
+# --- Режим темы и выбор эффекта -------------------------------------------------
+# Ровный свет везде. Любая анимация на лентах, вентиляторах и помпе читается как
+# мигание и мельтешение, а замедление не помогает: поэтому по умолчанию эффектов
+# нет вообще, а тема задаёт цвет. Если когда-нибудь захочется оживить помпу —
+# запустите скрипт с AIO_ANIMATION=pulse.
+theme_slug=$(cat "$(dirname "$STATE_DIR")/theme.name" 2>/dev/null | tr -d '\n' || true)
+theme_slug=${theme_slug:-$THEME_NAME}
+theme_slug=$(printf '%s' "$theme_slug" | tr '[:upper:]' '[:lower:]' | tr ' ' '-')
+
+theme_mode=$(sed -n 's/^[[:space:]]*mode[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$COLORS" | head -n1)
+if [[ $theme_mode != light && $theme_mode != dark ]]; then
+    bg_r=$((16#${background:1:2})); bg_g=$((16#${background:3:2})); bg_b=$((16#${background:5:2}))
+    if (( (299 * bg_r + 587 * bg_g + 114 * bg_b) / 1000 > 127 )); then theme_mode=light; else theme_mode=dark; fi
+fi
+
+# none — везде ровный свет; pulse — аппаратное дыхание на помпе и вентиляторах AIO.
+AIO_ANIMATION=${AIO_ANIMATION:-none}
+if [[ $theme_mode == light || $AIO_ANIMATION == none ]]; then
+    family=static
+else
+    family=calm
+fi
+log "режим темы $theme_mode, эффект у устройств: $family"
+
+# --- 1. bezel: тема панели 8.8" -------------------------------------------------
+gen_bezel() {
+    [[ -d $BEZEL_SRC ]] || { log "нет шаблона $BEZEL_SRC, панель пропускаю"; return; }
+
+    python3 - "$BEZEL_SRC" "$BEZEL_OUT" "$accent" "$background" "$foreground" \
+        "$color2" "$color3" "$color4" "$color5" "$color6" "$color7" "$color8" <<'PY'
+import json, os, shutil, sys
+
+src, dst = sys.argv[1], sys.argv[2]
+accent, background, foreground, c2, c3, c4, c5, c6, c7, c8 = sys.argv[3:13]
+
+
+def mix(base, other, pct):
+    """pct процентов other в base — для оттенков вроде панельного фона."""
+    a = [int(base[i : i + 2], 16) for i in (1, 3, 5)]
+    b = [int(other[i : i + 2], 16) for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple((x * (100 - pct) + y * pct) // 100 for x, y in zip(a, b))
+
+
+# Роли цветов в Midnight видны по частотности: фон, основной текст, приглушённый
+# текст, тусклый текст, полупрозрачные подсветки панелей и несколько акцентов для
+# шкал. Ключ — RGB без альфы, поэтому варианты вроде #22d3ee6e/#22d3ee00
+# переносятся вместе со своей прозрачностью.
+role = {
+    "#05070c": background,          # фон холста
+    "#0c1224": mix(background, foreground, 8),   # панели под графиками
+    "#f3f5fa": foreground,          # основной текст
+    "#8b94a9": c7,                  # подписи
+    "#5c6578": c8,                  # самые тусклые подписи
+    "#ffffff": foreground,          # полупрозрачные обводки и заливки
+    "#38bdf8": c4,                  # + их альфы
+    "#34d399": c2,
+    "#fbbf24": c3,
+    "#fb923c": c3,
+    "#2dd4bf": c6,
+    "#22d3ee": c6,
+    "#c084fc": c5,
+    "#6366f1": c5,
+    "#f472b6": c5,
+    "#a3e635": c2,
+}
+
+
+def recolor(node):
+    if isinstance(node, dict):
+        return {k: recolor(v) for k, v in node.items()}
+    if isinstance(node, list):
+        return [recolor(v) for v in node]
+    if isinstance(node, str) and node.startswith("#") and len(node) in (7, 9):
+        base, alpha = node[:7].lower(), node[7:]
+        if base in role:
+            return role[base] + alpha
+    return node
+
+
+# Базу берём всегда из оригинального шаблона, а не из своего же результата:
+# иначе при следующей теме в файле уже лежат цвета прошлой темы, они не совпадают
+# с таблицей ролей, и генератор решает, что менять нечего.
+path = os.path.join(dst, "theme.json")
+old = open(path, encoding="utf-8").read() if os.path.exists(path) else ""
+
+# Ассеты (шрифты, картинки) копируем, theme.json — нет, он генерируется ниже.
+shutil.copytree(src, dst, dirs_exist_ok=True, ignore=shutil.ignore_patterns("theme.json"))
+
+theme = json.load(open(os.path.join(src, "theme.json"), encoding="utf-8"))
+theme["name"] = "Omarchy 8.8"
+theme["orientation"] = "reverse-portrait"
+theme = recolor(theme)
+new = json.dumps(theme, ensure_ascii=False, indent=2) + "\n"
+
+if old != new:
+    open(path, "w", encoding="utf-8").write(new)
+    print("CHANGED")
+else:
+    print("SAME")
+PY
+}
+
+bezel_state=$(gen_bezel | tail -n1)
+if [[ $bezel_state == CHANGED ]]; then
+    log "тема панели обновлена: $BEZEL_OUT"
+    if systemctl --user is-enabled "$BEZEL_UNIT" >/dev/null 2>&1; then
+        systemctl --user restart "$BEZEL_UNIT" || true
+        log "служба $BEZEL_UNIT перезапущена"
+    else
+        log "служба $BEZEL_UNIT не включена, панель перерисуется при следующем запуске"
+    fi
+else
+    log "тема панели без изменений"
+fi
+
+# Яркость, выбранная ползунком. Ею масштабируется всё, что красит этот хук:
+# цвета платы, ленты и экран водянки. Один источник, чтобы после смены темы
+# ничего не оставалось на полной яркости.
+RGB_STATE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-rgb/state.json"
+log "палитра: тема $THEME_NAME, accent $accent, фон $background"
+rgb_level=100
+if [[ -r $RGB_STATE ]]; then
+    rgb_level=$(python3 - "$RGB_STATE" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        state = json.load(handle)
+except (OSError, ValueError):
+    print(100)
+    raise SystemExit
+print(0 if state.get("on") is False else int(state.get("brightness", 100)))
+PY
+)
+fi
+[[ $rgb_level =~ ^[0-9]+$ ]] || rgb_level=100
+
+# Применяет цвета к демону по IPC: без остановки службы, поэтому подсветка
+# меняется сразу, а не после пятнадцатисекундной инициализации демона.
+apply_lianli_live() {
+    local level=${1:-100}
+    python3 - "$LIANLI_CFG" "$level" "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/lianli-daemon.sock" <<'PY'
+import json
+import os
+import socket
+import sys
+
+config_path, level_raw, socket_path = sys.argv[1], sys.argv[2], sys.argv[3]
+level = max(0, min(100, int(level_raw)))
+
+
+def call(request):
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(6)
+        sock.connect(socket_path)
+        sock.sendall(json.dumps(request).encode() + b"\n")
+        buf = b""
+        while b"\n" not in buf:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    return json.loads(buf.decode())
+
+
+try:
+    read = call({"method": "GetConfig"})
+    info = call({"method": "GetDaemonInfo"})["data"]
+except Exception as error:
+    print(f"нет связи с демоном: {error}")
+    sys.exit(1)
+if read.get("status") != "ok":
+    print(read.get("message", "конфиг недоступен"))
+    sys.exit(1)
+
+with open(config_path, encoding="utf-8") as handle:
+    on_disk = json.load(handle)
+
+guard = {
+    "client_version": info["version"],
+    "protocol_version": info["protocol_version"],
+    "instance_id": info["instance_id"],
+}
+answer = call({
+    "method": "Guarded",
+    "params": {
+        "guard": guard,
+        "request": {"method": "SetRgbConfig", "params": {"config": on_disk["rgb"]}},
+    },
+})
+if answer.get("status") != "ok":
+    print(answer.get("message", "цвет не принят"))
+    sys.exit(1)
+
+# Шаблон экрана (это цвета подписей и значений) тоже обновляем на живую: демон
+# сохраняет его и перерисовывает медиа сам, без перезапуска службы. Раньше
+# перезапуск был нужен только ради этого, а он задерживал подсветку вентиляторов
+# водянки на пятнадцать секунд.
+templates_path = os.path.join(os.path.dirname(config_path), "lcd_templates.json")
+try:
+    with open(templates_path, encoding="utf-8") as handle:
+        templates = json.load(handle).get("templates") or []
+except (OSError, ValueError):
+    templates = []
+if templates:
+    answer = call({
+        "method": "Guarded",
+        "params": {
+            "guard": guard,
+            "request": {
+                "method": "SetLcdTemplates",
+                "params": {"templates": templates},
+            },
+        },
+    })
+    if answer.get("status") != "ok":
+        print(answer.get("message", "шаблон не принят"))
+        sys.exit(2)
+
+# Яркость экрана водянки ставится отдельно и живёт в самой службе.
+for entry in read["data"]["rgb"]["devices"]:
+    device = str(entry.get("device_id", ""))
+    if not device.startswith("hid:0416:7395"):
+        continue
+    try:
+        call({
+            "method": "Guarded",
+            "params": {
+                "guard": guard,
+                "request": {
+                    "method": "SetLcdBrightness",
+                    "params": {"device_id": device, "brightness": level},
+                },
+            },
+        })
+    except Exception as error:
+        print(f"яркость экрана не принята: {error}")
+sys.exit(0)
+PY
+}
+
+# Ждём, пока демон Lian Li не только поднимет сокет, но и увидит RGB-устройства.
+wait_for_lianli_rgb() {
+    local socket_path="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/lianli-daemon.sock"
+    local attempt
+    for attempt in $(seq 1 40); do
+        if python3 - "$socket_path" <<'PY' 2>/dev/null
+import json
+import socket
+import sys
+
+try:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(2)
+        sock.connect(sys.argv[1])
+        sock.sendall(b'{"method":"GetRgbCapabilities"}\n')
+        buf = b""
+        while b"\n" not in buf:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            buf += chunk
+    payload = json.loads(buf.decode())
+except Exception:
+    sys.exit(1)
+sys.exit(0 if payload.get("status") == "ok" and payload.get("data") else 1)
+PY
+        then
+            return 0
+        fi
+        sleep 1
+    done
+    log "демон Lian Li не отдал RGB-устройства, яркость применится при следующем изменении"
+    return 1
+}
+
+# --- 2. OpenRGB: плата и видеокарта --------------------------------------------
+if command -v openrgb >/dev/null 2>&1; then
+    apply_openrgb() {
+        local device=$1 mode=$2
+        # OpenRGB принимает цвета без '#', с ним команда молча отваливается.
+        # Клиентский режим работает с уже поднятым сервером и не пересканирует
+        # машину заново: полное сканирование — это три секунды на устройство.
+        # Цвет пишет ровно один путь; массив светодиодов мы больше не трогаем,
+        # иначе железо показывает то, что записано последним, и цвета расходятся.
+        if timeout 25 openrgb --client 127.0.0.1:6742 -d "$device" -m "$mode" -c "$board_color" \
+            >/dev/null 2>&1; then
+            return 0
+        fi
+        # -s 10 — самая медленная анимация: режимы с быстрым мерцанием выглядят
+        # навязчиво, а наша задача — плавный ход.
+        if ! timeout 60 openrgb --noautoconnect -d "$device" -m "$mode" -s 10 -c "$board_color" \
+            >/dev/null 2>&1; then
+            log "OpenRGB: не удалось применить '$mode' к '$device'"
+        fi
+    }
+    # У платы и видеокарты только ровный свет: любой их эффект на ленте читается
+    # как мигание, а скорость у ASRock инвертирована и всё равно не спасает.
+    openrgb_mode() { echo Static; }
+    # Драйвер платы не понимает параметр яркости (у режима Static не выставлен
+    # флаг MODE_FLAG_HAS_BRIGHTNESS), поэтому уровень масштабируется в сам цвет —
+    # ровно так же, как это делает плагин из своего ползунка.
+    # У цепочки на разъёмах платы зелёный зажигается позже остальных каналов:
+    # на полной яркости разницы нет, а на слабых уровнях серый уходит в розовый.
+    # Кривая лежит в файле board-gains ("множительR показательR множительG
+    # показательG множительB показательB"), её же использует быстрый путь.
+    board_color=$(python3 - "$accent" "$rgb_level" "$STATE_DIR_RGB/board-gains" <<'PY'
+import sys
+
+accent = sys.argv[1].lstrip("#")
+level = max(0, min(100, int(sys.argv[2])))
+gains_path = sys.argv[3]
+curve = [(1.0, 1.0)] * 3
+try:
+    with open(gains_path, encoding="utf-8") as handle:
+        parts = [float(part) for part in handle.read().split()]
+    if len(parts) == 3:
+        curve = [(max(0.0, min(1.0, part)), 1.0) for part in parts]
+    elif len(parts) >= 6:
+        curve = [
+            (max(0.0, min(2.0, parts[index])), max(0.05, min(4.0, parts[index + 1])))
+            for index in (0, 2, 4)
+        ]
+except (OSError, ValueError):
+    pass
+
+scaled = [int(accent[index:index + 2], 16) * level / 100 for index in (0, 2, 4)]
+shaped = [
+    max(0, min(255, round(255.0 * (value / 255.0) ** gamma * gain)))
+    for value, (gain, gamma) in zip(scaled, curve)
+]
+print("".join(f"{value:02x}" for value in shaped))
+PY
+)
+    # RAM (ENE DRAM) в список не входит намеренно.
+    #
+    # Плата красится в ФОНЕ: запись через сервер занимает около секунды на
+    # устройство, и, если делать её здесь, подсветка водянки (следующий шаг)
+    # отстаёт на эти секунды. Цвет платы задаётся цветом режима — массив
+    # светодиодов не трогаем, иначе железо показывает то, что записано последним.
+    board_writer=$(
+        binary=$(command -v omarchy-rgb 2>/dev/null) || exit 0
+        resolved=$(readlink -f "$binary" 2>/dev/null) || exit 0
+        dir=$(dirname "$resolved")
+        [[ -f $dir/openrgb-fast.py ]] && printf '%s' "$dir/openrgb-fast.py"
+    )
+    (
+        wrote=no
+        # Видеокарту не пишем: OpenRGB её не контролирует (устройство остаётся Off),
+        # а каждая лишняя запись — это ещё секунда.
+        if [[ -n $board_writer ]] && python3 "$board_writer" mode "$rgb_level" "$accent" \
+            "ASRock X870 Pro RS WiFi" >/dev/null 2>&1; then
+            wrote=yes
+            log "OpenRGB: цвет платы и видеокарты записан через сервер"
+        fi
+        if [[ $wrote == no ]]; then
+            if (( rgb_level <= 0 )); then
+                apply_openrgb "ASRock X870 Pro RS WiFi" Off
+                log "OpenRGB: свет выключен (ползунок на нуле)"
+            else
+                apply_openrgb "ASRock X870 Pro RS WiFi" "$(openrgb_mode board)"
+            fi
+        fi
+    ) &
+    # Сервер OpenRGB поднимаем в фоне: в следующий раз запись цвета пойдёт через
+    # него и будет занимать доли секунды. Устройства при этом не сканируются
+    # заново, потому что пишем по имени.
+    fast_plugin=$(
+        binary=$(command -v omarchy-rgb 2>/dev/null) || exit 0
+        resolved=$(readlink -f "$binary" 2>/dev/null) || exit 0
+        dir=$(dirname "$resolved")
+        [[ -f $dir/openrgb-fast.py ]] && printf '%s' "$dir/openrgb-fast.py"
+    )
+    if [[ -n $fast_plugin ]]; then
+        python3 "$fast_plugin" warmup "ASRock X870 Pro RS WiFi" >/dev/null 2>&1 &
+    fi
+fi
+
+# --- 3. Lian Li: подсветка помпы и цвета экрана AIO -----------------------------
+gen_lianli() {
+    # $1 = check | apply. В режиме check файлы не пишутся, только отчёт:
+    # так демон останавливается лишь когда есть что менять.
+    python3 - "$1" "$LIANLI_CFG" "$LIANLI_TPL" "$accent" "$background" "$color2" "$color4" "$color6" "$color7" "$family" "$rgb_level" <<'PY'
+import json, os, sys
+
+mode, cfg_path, tpl_path = sys.argv[1], sys.argv[2], sys.argv[3]
+accent, background, c2, c4, c6, c7, family, level_raw = sys.argv[4:12]
+level = max(0, min(100, int(level_raw)))
+scale = level / 100.0
+apply = mode == "apply"
+
+# Имена совпадают с режимами водянки. В режиме calm дыхание оставляем только на
+# водянке: её анимация аппаратная, плавная и уже на минимальной скорости.
+lianli_mode = "Breathing" if family == "calm" else "Static"
+wired_only = "Static"
+
+state = {"config": False, "template": False}
+
+if os.path.exists(cfg_path):
+    cfg = json.load(open(cfg_path, encoding="utf-8"))
+    before = json.dumps(cfg, sort_keys=True, ensure_ascii=False)
+    rgb = cfg.get("rgb") or {}
+    accent_rgb = list(bytes.fromhex(accent.lstrip("#")))
+    for device in rgb.get("devices", []):
+        did = device.get("device_id", "")
+        for zone in device.get("zones", []):
+            # Всё, что светится у Lian Li, идёт в accent темы: помпа AIO (зона 0),
+            # вентиляторы водянки (зона 1) и беспроводная группа (Strimer и
+            # вентиляторы на донгле). RAM по-прежнему не трогаем.
+            applies = did.startswith("wireless:") or (
+                did.startswith("hid:0416:7395") and zone.get("zone_index") in (0, 1)
+            )
+            if not applies:
+                continue
+            effect = zone.setdefault("effect", {})
+            # Дыхание — только помпа и вентиляторы водянки; беспроводные ленты и
+            # вентиляторы получают ровный цвет.
+            effect["mode"] = lianli_mode if did.startswith("hid:0416:7395") else wired_only
+            # Яркость живёт в цвете: уровень ползунка умножается на акцент темы.
+            effect["colors"] = [[max(0, min(255, round(channel * scale))) for channel in accent_rgb]]
+            effect["disabled"] = level <= 0
+            effect["brightness"] = 4 if level > 0 else 0
+            # speed 0-4, нуль — самый медленный ход: просили плавность, а не
+            # мельтешение.
+            effect["speed"] = 0
+    for entry in cfg.get("lcds") or []:
+        entry["brightness"] = level
+    if json.dumps(cfg, sort_keys=True, ensure_ascii=False) != before:
+        state["config"] = True
+        if apply:
+            json.dump(cfg, open(cfg_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
+if os.path.exists(tpl_path):
+    doc = json.load(open(tpl_path, encoding="utf-8"))
+    before = json.dumps(doc, sort_keys=True, ensure_ascii=False)
+
+    def rgb_of(hex_color, alpha=255):
+        r, g, b = bytes.fromhex(hex_color.lstrip("#"))
+        return [r, g, b, alpha]
+
+    value_colors = {
+        "val-cpu-temp": accent,
+        "val-cpu-load": c4,
+        "val-gpu-temp": c6,
+        "val-gpu-load": c2,
+    }
+    for template in doc.get("templates", []):
+        background_cfg = template.get("background")
+        if isinstance(background_cfg, dict) and background_cfg.get("type") == "color":
+            background_cfg["rgb"] = rgb_of(background)
+        for widget in template.get("widgets", []):
+            kind = widget.get("kind") or {}
+            widget_id = widget.get("id", "")
+            if kind.get("type") == "label":
+                kind["color"] = rgb_of(c7)
+            elif kind.get("type") == "value_text":
+                kind["color"] = rgb_of(value_colors.get(widget_id, accent))
+    if json.dumps(doc, sort_keys=True, ensure_ascii=False) != before:
+        state["template"] = True
+        if apply:
+            json.dump(doc, open(tpl_path, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
+
+print("config=%s template=%s" % (state["config"], state["template"]))
+PY
+}
+
+if [[ ! -f $LIANLI_CFG ]]; then
+    log "конфиг Lian Li не найден, подсветку водянки пропускаю"
+else
+    was_active=no
+    systemctl --user is-active "$LIANLI_UNIT" >/dev/null 2>&1 && was_active=yes
+    lianli_state=$(gen_lianli check)
+    if [[ $lianli_state == *"True"* ]]; then
+        # Службу на время правки не останавливаем: цвет применяется на живую по
+        # IPC, иначе подсветка ждала бы перезапуска демона и его инициализации —
+        # это те самые пятнадцать секунд задержки. Файл всё равно пишем: он нужен,
+        # если демон не запущен или упадёт.
+        log "конфиг Lian Li обновлён ($(gen_lianli apply))"
+        live_ok=no
+        if [[ $was_active == yes ]]; then
+            if live_out=$(apply_lianli_live "$rgb_level" 2>&1); then
+                live_ok=yes
+                log "Lian Li: цвета и шаблон применены на живую, без перезапуска"
+            else
+                log "Lian Li: живое применение не прошло: $(printf '%s' "$live_out" | tail -c 200)"
+                systemctl --user restart "$LIANLI_UNIT" || true
+            fi
+        else
+            log "демон Lian Li не запущен, файлы обновлены и применятся при старте"
+        fi
+        # Экран водянки перерисовывается тем же живым применением, поэтому
+        # перезапуск нужен только если оно не прошло целиком.
+        if [[ $was_active == yes && $live_ok == no ]]; then
+            systemctl --user restart "$LIANLI_UNIT" || log "демон Lian Li не поднялся"
+            log "демон Lian Li перезапущен как запасной путь"
+        fi
+    else
+        log "конфиг Lian Li без изменений ($lianli_state)"
+    fi
+fi
+
+# --- 4. панель 8.8" ------------------------------------------------------------
+# Подсветка водянки и цвета Lian Li уже ушли в конфиг выше, вместе с яркостью
+# ползунка. Панель живёт отдельно от демона Lian Li, поэтому её красим здесь.
+if command -v bezel >/dev/null 2>&1; then
+    timeout 30 bezel brightness "$rgb_level" >/dev/null 2>&1 || true
+    # Панель могла быть перезапущена выше: своя инициализация заканчивается уже
+    # после запуска службы и может вернуть подсветку на полную. Повторяем
+    # значение чуть позже — команда идемпотентная и почти бесплатная.
+    if [[ $bezel_state == CHANGED ]]; then
+        ( sleep 4; timeout 30 bezel brightness "$rgb_level" >/dev/null 2>&1 || true ) &
+    fi
+    log "панель 8.8\": яркость ${rgb_level}%"
+fi
+
+log "готово"
