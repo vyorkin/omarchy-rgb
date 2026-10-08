@@ -25,6 +25,18 @@ import os
 import sys
 
 SIZE = 480
+
+# Шрифты для экрана. Жирное начертание для значений и обычное для подписей — оба
+# из стандартного набора Liberation, он есть в Arch вместе с fonts-liberation.
+FONT_BOLD = "/usr/share/fonts/liberation/LiberationSans-Bold.ttf"
+FONT_REGULAR = "/usr/share/fonts/liberation/LiberationSans-Regular.ttf"
+
+# Ширина одного знака в долях кегля. Не оценка: измерено у самих файлов шрифтов
+# (Pillow, getlength("100")/3/размер), поэтому размеры рамок и кегли считаются
+# по факту. У Liberation Sans Bold знак занимает 0.556 кегля, у обычного столько
+# же; прежде здесь стояла оценка 0.66, из-за чего кегль получался на четверть
+# меньше возможного.
+DIGIT_RATIO = 0.556
 SENSOR_FALLBACK = {
     "cpu_temp": {"type": "hwmon", "name": "k10temp", "label": "Tctl"},
     "cpu_load": {"type": "cpu_usage"},
@@ -110,10 +122,19 @@ def sources_from_current(path: str | None) -> dict:
 
 # -------------------------------------------------------------------- виджеты ---
 
+def font_ref(path: str) -> dict:
+    """Ссылка на шрифт для виджета.
+
+    Пустой объект означает встроенный шрифт демона. Указанный файл он загружает
+    сам; требуется обычный файл не больше 32 МиБ, что для системных шрифтов так.
+    """
+    return {"path": path} if path and os.path.exists(path) else {}
+
+
 def label(widget_id: str, text: str, x: float, y: float, size: float, color, width: float = 200):
     return {
         "id": widget_id,
-        "kind": {"type": "label", "text": text, "font": {}, "font_size": size,
+        "kind": {"type": "label", "text": text, "font": font_ref(FONT_REGULAR), "font_size": size,
                  "color": with_alpha(color), "align": "center"},
         "x": x, "y": y, "width": width, "height": size * 1.4,
     }
@@ -127,7 +148,7 @@ def value_box(size: float, digits: int = 3, margin: float = 1.08) -> tuple[float
     выглядит как наложенные друг на друга символы. Единицу измерения поэтому
     показывает подпись, а значение занимает не больше трёх знаков.
     """
-    width = size * 0.66 * digits * margin
+    width = size * DIGIT_RATIO * digits * margin
     height = size * 1.28 * margin
     return round(width), round(height)
 
@@ -138,8 +159,8 @@ def value(widget_id: str, source, x: float, y: float, size: float, color,
     return {
         "id": widget_id,
         "kind": {"type": "value_text", "source": source, "format": "{:.0}", "unit": unit,
-                 "font": {}, "font_size": size, "color": with_alpha(color), "align": "center",
-                 "value_min": 0, "value_max": value_max},
+                 "font": font_ref(FONT_BOLD), "font_size": size, "color": with_alpha(color),
+                 "align": "center", "value_min": 0, "value_max": value_max},
         "x": x, "y": y, "width": width or box_width, "height": box_height,
     }
 
@@ -173,10 +194,10 @@ def theme_grid(sources: dict, background, labels, values) -> tuple[str, str, lis
     # Ячейка 480x480 делится на четыре по 240: и подписи, и значения остаются
     # внутри своей ячейки, иначе соседние виджеты затирают друг друга.
     cells = {
-        "cpu_temp": (120, 40, 162),
-        "cpu_load": (360, 40, 162),
-        "gpu_temp": (120, 270, 392),
-        "gpu_load": (360, 270, 392),
+        "cpu_temp": (120, 38, 158),
+        "cpu_load": (360, 38, 158),
+        "gpu_temp": (120, 268, 388),
+        "gpu_load": (360, 268, 388),
     }
     for key, (x, label_y, value_y) in cells.items():
         unit = "°C" if key.endswith("temp") else "%"
@@ -186,7 +207,7 @@ def theme_grid(sources: dict, background, labels, values) -> tuple[str, str, lis
         widgets.append(label(f"lbl-{key.replace('_', '-')}",
                              LABELS[key].replace("TEMP", "TEMP " + unit).replace("LOAD", "LOAD " + unit),
                              x, label_y, 26, labels, width=230))
-        widgets.append(value(f"val-{key.replace('_', '-')}", sources[key], x, value_y, 116,
+        widgets.append(value(f"val-{key.replace('_', '-')}", sources[key], x, value_y, 130,
                              values[key], unit="", width=236, value_max=maximum))
     return "grid", "Сетка", widgets
 
@@ -194,16 +215,16 @@ def theme_grid(sources: dict, background, labels, values) -> tuple[str, str, lis
 def theme_large(sources: dict, background, labels, values) -> tuple[str, str, list]:
     widgets = [
         label("lbl-cpu-temp", "CPU °C", 120, 44, 32, labels, width=230),
-        value("val-cpu-temp", sources["cpu_temp"], 120, 176, 112, values["cpu_temp"],
+        value("val-cpu-temp", sources["cpu_temp"], 120, 176, 128, values["cpu_temp"],
               unit="", width=230, value_max=110),
         label("lbl-gpu-temp", "GPU °C", 360, 44, 32, labels, width=230),
-        value("val-gpu-temp", sources["gpu_temp"], 360, 176, 112, values["gpu_temp"],
+        value("val-gpu-temp", sources["gpu_temp"], 360, 176, 128, values["gpu_temp"],
               unit="", width=230, value_max=110),
         label("lbl-cpu-load", "CPU %", 120, 330, 30, labels, width=230),
-        value("val-cpu-load", sources["cpu_load"], 120, 424, 68, values["cpu_load"],
+        value("val-cpu-load", sources["cpu_load"], 120, 420, 76, values["cpu_load"],
               unit="", width=230),
         label("lbl-gpu-load", "GPU %", 360, 330, 30, labels, width=230),
-        value("val-gpu-load", sources["gpu_load"], 360, 424, 68, values["gpu_load"],
+        value("val-gpu-load", sources["gpu_load"], 360, 420, 76, values["gpu_load"],
               unit="", width=230),
     ]
     return "large", "Крупные цифры", widgets
@@ -211,15 +232,17 @@ def theme_large(sources: dict, background, labels, values) -> tuple[str, str, li
 
 def theme_bars(sources: dict, background, labels, values) -> tuple[str, str, list]:
     widgets = []
-    rows = [("cpu_temp", 62), ("cpu_load", 172), ("gpu_temp", 282), ("gpu_load", 392)]
+    # Четыре строки на 480 px — по 116 px на каждую: значение с полосой под ним
+    # должны укладываться в свою строку, иначе рамки начинают пересекаться.
+    rows = [("cpu_temp", 58), ("cpu_load", 176), ("gpu_temp", 294), ("gpu_load", 412)]
     for key, y in rows:
         unit = "°C" if key.endswith("temp") else "%"
         maximum = 110 if key.endswith("temp") else 100
         widgets.append(label(f"lbl-{key.replace('_', '-')}", f"{LABELS[key]} {unit}",
                              120, y, 30, labels, width=220))
-        widgets.append(value(f"val-{key.replace('_', '-')}", sources[key], 392, y, 56,
+        widgets.append(value(f"val-{key.replace('_', '-')}", sources[key], 392, y, 66,
                              values[key], unit="", width=150, value_max=maximum))
-        widgets.append(bar(f"bar-{key.replace('_', '-')}", sources[key], 240, y + 50, 400,
+        widgets.append(bar(f"bar-{key.replace('_', '-')}", sources[key], 240, y + 54, 400,
                            values[key], background))
     return "bars", "Полосы", widgets
 
@@ -232,15 +255,15 @@ def theme_gauges(sources: dict, background, labels, values) -> tuple[str, str, l
               background, value_max=110),
         label("lbl-cpu-temp", "CPU °C", 130, 40, 30, labels, width=180),
         label("lbl-gpu-temp", "GPU °C", 350, 40, 30, labels, width=180),
-        value("val-cpu-temp", sources["cpu_temp"], 130, 168, 52, values["cpu_temp"],
+        value("val-cpu-temp", sources["cpu_temp"], 130, 168, 64, values["cpu_temp"],
               unit="", width=140, value_max=110),
-        value("val-gpu-temp", sources["gpu_temp"], 350, 168, 52, values["gpu_temp"],
+        value("val-gpu-temp", sources["gpu_temp"], 350, 168, 64, values["gpu_temp"],
               unit="", width=140, value_max=110),
         label("lbl-cpu-load", "CPU LOAD %", 130, 306, 26, labels, width=220),
-        value("val-cpu-load", sources["cpu_load"], 130, 392, 56, values["cpu_load"],
+        value("val-cpu-load", sources["cpu_load"], 130, 392, 74, values["cpu_load"],
               unit="", width=200),
         label("lbl-gpu-load", "GPU LOAD %", 350, 306, 26, labels, width=220),
-        value("val-gpu-load", sources["gpu_load"], 350, 392, 56, values["gpu_load"],
+        value("val-gpu-load", sources["gpu_load"], 350, 392, 74, values["gpu_load"],
               unit="", width=200),
     ]
     return "gauges", "Приборы", widgets
@@ -346,9 +369,9 @@ def check(templates: list) -> list:
             boxes.append((widget["id"], x - width / 2, y - height / 2, x + width / 2, y + height / 2))
             size = kind.get("font_size", 0)
             if kind["type"] == "label":
-                needed = len(kind.get("text", "")) * size * 0.62
+                needed = len(kind.get("text", "")) * size * DIGIT_RATIO
             elif kind["type"] == "value_text":
-                needed = 3 * size * 0.62
+                needed = 3 * size * DIGIT_RATIO
             else:
                 needed = 0
             if needed and needed > width:
