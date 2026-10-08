@@ -119,7 +119,7 @@ def label(widget_id: str, text: str, x: float, y: float, size: float, color, wid
     }
 
 
-def value_box(size: float, digits: int = 3, margin: float = 1.15) -> tuple[float, float]:
+def value_box(size: float, digits: int = 3, margin: float = 1.08) -> tuple[float, float]:
     """Рамка под число с запасом.
 
     Ширина считается по шрифту, а не на глаз: если рамка меньше нарисованного
@@ -127,8 +127,8 @@ def value_box(size: float, digits: int = 3, margin: float = 1.15) -> tuple[float
     выглядит как наложенные друг на друга символы. Единицу измерения поэтому
     показывает подпись, а значение занимает не больше трёх знаков.
     """
-    width = size * 0.7 * digits * margin
-    height = size * 1.3 * margin
+    width = size * 0.66 * digits * margin
+    height = size * 1.28 * margin
     return round(width), round(height)
 
 
@@ -173,19 +173,21 @@ def theme_grid(sources: dict, background, labels, values) -> tuple[str, str, lis
     # Ячейка 480x480 делится на четыре по 240: и подписи, и значения остаются
     # внутри своей ячейки, иначе соседние виджеты затирают друг друга.
     cells = {
-        "cpu_temp": (120, 52, 170),
-        "cpu_load": (360, 52, 170),
-        "gpu_temp": (120, 262, 380),
-        "gpu_load": (360, 262, 380),
+        "cpu_temp": (120, 40, 162),
+        "cpu_load": (360, 40, 162),
+        "gpu_temp": (120, 270, 392),
+        "gpu_load": (360, 270, 392),
     }
     for key, (x, label_y, value_y) in cells.items():
         unit = "°C" if key.endswith("temp") else "%"
         maximum = 110 if key.endswith("temp") else 100
+        # Подпись здесь вспомогательная, поэтому она мельче и ужата к краю: место
+        # в ячейке отдано числу, ради которого на экран и смотрят.
         widgets.append(label(f"lbl-{key.replace('_', '-')}",
                              LABELS[key].replace("TEMP", "TEMP " + unit).replace("LOAD", "LOAD " + unit),
-                             x, label_y, 30, labels, width=230))
-        widgets.append(value(f"val-{key.replace('_', '-')}", sources[key], x, value_y, 92,
-                             values[key], unit="", width=230, value_max=maximum))
+                             x, label_y, 26, labels, width=230))
+        widgets.append(value(f"val-{key.replace('_', '-')}", sources[key], x, value_y, 116,
+                             values[key], unit="", width=236, value_max=maximum))
     return "grid", "Сетка", widgets
 
 
