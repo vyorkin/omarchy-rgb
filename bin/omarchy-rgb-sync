@@ -27,6 +27,16 @@ BEZEL_SRC="$BEZEL_THEMES/turing-8.8-vertical"
 BEZEL_OUT="$BEZEL_THEMES/omarchy-8.8"
 BEZEL_UNIT="bezel-run@omarchy-8.8"
 LIANLI_UNIT="lianli-daemon.service"
+# Имя устройства и режим платы зависят от машины, поэтому лежат в файле, а не в
+# коде: этот же скрипт работает и на хосте с ASRock. Файл пишет setup-fan-rgb.sh.
+BOARD_CONF="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-rgb/board.conf"
+board_conf() { # $1 = ключ
+    [[ -r $BOARD_CONF ]] || return 0
+    sed -n "s/^$1=//p" "$BOARD_CONF" | head -n1
+}
+BOARD_DEVICE=$(board_conf device)
+BOARD_DEVICE=${BOARD_DEVICE:-ASRock X870 Pro RS WiFi}
+BOARD_MODE=$(board_conf mode)
 
 # Журнал рядом с состоянием плагина: смену темы запускает не человек, и без
 # записи потом не видно, какую палитру хук прочитал и что успел записать.
@@ -359,7 +369,7 @@ if command -v openrgb >/dev/null 2>&1; then
     }
     # У платы и видеокарты только ровный свет: любой их эффект на ленте читается
     # как мигание, а скорость у ASRock инвертирована и всё равно не спасает.
-    openrgb_mode() { echo Static; }
+    openrgb_mode() { printf '%s' "${BOARD_MODE:-Static}"; }
     # Драйвер платы не понимает параметр яркости (у режима Static не выставлен
     # флаг MODE_FLAG_HAS_BRIGHTNESS), поэтому уровень масштабируется в сам цвет —
     # ровно так же, как это делает плагин из своего ползунка.
@@ -412,16 +422,16 @@ PY
         # Видеокарту не пишем: OpenRGB её не контролирует (устройство остаётся Off),
         # а каждая лишняя запись — это ещё секунда.
         if [[ -n $board_writer ]] && python3 "$board_writer" mode "$rgb_level" "$accent" \
-            "ASRock X870 Pro RS WiFi" >/dev/null 2>&1; then
+            "$BOARD_DEVICE" >/dev/null 2>&1; then
             wrote=yes
             log "OpenRGB: цвет платы и видеокарты записан через сервер"
         fi
         if [[ $wrote == no ]]; then
             if (( rgb_level <= 0 )); then
-                apply_openrgb "ASRock X870 Pro RS WiFi" Off
+                apply_openrgb "$BOARD_DEVICE" Off
                 log "OpenRGB: свет выключен (ползунок на нуле)"
             else
-                apply_openrgb "ASRock X870 Pro RS WiFi" "$(openrgb_mode board)"
+                apply_openrgb "$BOARD_DEVICE" "$(openrgb_mode board)"
             fi
         fi
     ) &
@@ -435,7 +445,7 @@ PY
         [[ -f $dir/openrgb-fast.py ]] && printf '%s' "$dir/openrgb-fast.py"
     )
     if [[ -n $fast_plugin ]]; then
-        python3 "$fast_plugin" warmup "ASRock X870 Pro RS WiFi" >/dev/null 2>&1 &
+        python3 "$fast_plugin" warmup "$BOARD_DEVICE" >/dev/null 2>&1 &
     fi
 fi
 
