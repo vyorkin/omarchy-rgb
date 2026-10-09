@@ -569,8 +569,19 @@ else
         lcd_theme=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('lcd_theme') or 'grid')" \
             "${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-rgb/state.json" 2>/dev/null || echo grid)
         if [[ -f $rgb_themes ]]; then
-            python3 "$rgb_themes" --palette "$COLORS" --current "$LIANLI_TPL" \
-                --write "$LIANLI_TPL" >/dev/null 2>&1 || true
+            # Тридцать секунд — тот же потолок, что у вызова из плагина: в цикле
+            # разбора палитры уже была ошибка, которая жгла ядро до перезагрузки,
+            # а хук смены темы ждать столько не может. Код возврата пишем в журнал:
+            # раньше отказ был безмолвным ("|| true"), и по логу нельзя было понять,
+            # что шаблон вообще не собрался.
+            rc=0
+            timeout 30 python3 "$rgb_themes" --palette "$COLORS" --current "$LIANLI_TPL" \
+                --write "$LIANLI_TPL" >/dev/null 2>&1 || rc=$?
+            case $rc in
+                0) ;;
+                124) log "экран водянки: генератор не ответил за 30 с, шаблон оставлен прежним" ;;
+                *) log "экран водянки: генератор завершился с кодом $rc, шаблон оставлен прежним" ;;
+            esac
         fi
         OMARCHY_RGB_FORCE=1 "$rgb_cli" lcdtheme "${lcd_theme:-grid}" >/dev/null 2>&1 || true
         log "экран водянки: тема ${lcd_theme:-grid}, цвета из палитры"

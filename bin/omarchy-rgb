@@ -775,8 +775,14 @@ cmd_lcd() {
 LCD_THEMES="$PLUGIN_DIR/bin/lcd_themes.py"
 LCD_TEMPLATES="${XDG_CONFIG_HOME:-$HOME/.config}/lianli/lcd_templates.json"
 
+# Любой разбор палитры ограничен по времени. Генератор считает контрасты цветов
+# в цикле, и ошибка в нём один раз уже стоила двух ядер, занятых полтора суток:
+# хук смены темы ждёт генератор и висит вместе с ним. Полминуты — это с запасом
+# больше самого медленного разбора, но меньше, чем человек готов ждать меню.
+lcd_themes_run() { timeout 30 python3 "$LCD_THEMES" "$@"; }
+
 cmd_lcdthemes() {
-    python3 "$LCD_THEMES" --list 2>/dev/null | while IFS=$'\t' read -r id name; do
+    lcd_themes_run --list 2>/dev/null | while IFS=$'\t' read -r id name; do
         current=$(state_get lcd_theme)
         [[ $id == "$current" ]] && mark=" *" || mark=""
         printf '%-8s %s%s\n' "$id" "$name" "$mark"
@@ -786,8 +792,8 @@ cmd_lcdthemes() {
 cmd_lcdtheme() {
     local theme=${1:-} current
     [[ -n $theme ]] || { cmd_lcdthemes; return 0; }
-    python3 "$LCD_THEMES" --list 2>/dev/null | cut -f1 | grep -qx "$theme" \
-        || die "неизвестная тема '$theme'; доступны: $(python3 "$LCD_THEMES" --list 2>/dev/null | cut -f1 | tr '\n' ' ')"
+    lcd_themes_run --list 2>/dev/null | cut -f1 | grep -qx "$theme" \
+        || die "неизвестная тема '$theme'; доступны: $(lcd_themes_run --list 2>/dev/null | cut -f1 | tr '\n' ' ')"
     current=$(state_get lcd_theme)
     if [[ $current == "$theme" && ${OMARCHY_RGB_FORCE:-0} != 1 ]]; then
         return 0
@@ -795,9 +801,9 @@ cmd_lcdtheme() {
     # Сначала проверка макета: рамка виджета — это и область, которую экран
     # затирает, поэтому текст шире рамки оставляет прежние цифры, и они
     # накладываются друг на друга. Битый макет на экран не отправляем.
-    check=$(python3 "$LCD_THEMES" --palette "$OMARCHY_COLORS" --current "$LCD_TEMPLATES" \
-        --check 2>&1) || die "макет темы экрана не прошёл проверку: $check"
-    python3 "$LCD_THEMES" --palette "$OMARCHY_COLORS" --current "$LCD_TEMPLATES" \
+    check=$(lcd_themes_run --palette "$OMARCHY_COLORS" --current "$LCD_TEMPLATES" \
+        --check 2>&1) || die "макет темы экрана не прошёл проверку: ${check:-генератор тем не ответил за 30 с}"
+    lcd_themes_run --palette "$OMARCHY_COLORS" --current "$LCD_TEMPLATES" \
         --write "$LCD_TEMPLATES" >/dev/null 2>&1 \
         || die "не удалось собрать темы экрана из палитры $OMARCHY_COLORS"
     shift_state_field lcd_theme "\"$theme\""

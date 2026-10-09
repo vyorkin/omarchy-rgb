@@ -86,6 +86,40 @@ def readable(color, background, minimum: float = 7.0):
     return [255, 255, 255, 255]
 
 
+def separate(color, seen, minimum: float = 1.35, steps: int = 24):
+    """Разводит цвет с уже занятыми по яркости.
+
+    Светлеть можно не бесконечно: у светлых палитр цвет упирается в белый, а
+    контраст белого с белым равен единице и различимым уже не станет никогда.
+    Поэтому итерации ограничены, и, если светлее двигаться некуда, цвет уходит
+    вниз, к тёмному: различаться должны цифры между собой, и неважно, светлее
+    они фона или темнее. Раньше здесь стоял неограниченный цикл, и на палитрах
+    со светлым акцентом скрипт жёг ядро на 100% до перезагрузки.
+    """
+
+    def far_enough(candidate):
+        return all(contrast(candidate, other) >= minimum for other in seen)
+
+    light = list(color)
+    for _ in range(steps):
+        if far_enough(light):
+            return light
+        light = [min(255, round(channel * 1.18 + 8)) for channel in light]
+
+    dark = [round(channel * 0.55) for channel in color]
+    for _ in range(steps):
+        if far_enough(dark):
+            return dark
+        dark = [max(0, round(channel * 0.82 - 6)) for channel in dark]
+
+    # Вырожденная палитра: отдаём вариант с наибольшим контрастом к занятым.
+    # Возврат здесь безусловный — зависнуть этот путь не может.
+    def worst_contrast(candidate):
+        return min((contrast(candidate, other) for other in seen), default=minimum)
+
+    return max((light, dark), key=worst_contrast)
+
+
 def with_alpha(color, alpha: int = 255):
     return [int(color[0]), int(color[1]), int(color[2]), alpha]
 
@@ -320,8 +354,7 @@ def build(palette_path: str, current_path: str | None) -> tuple[list, dict]:
     for key, color in raw_values.items():
         # Если палитра свела несколько значений в один цвет, разводим их по
         # яркости: иначе на экране четыре одинаковые цифры.
-        while any(contrast(color, other) < 1.35 for other in seen):
-            color = [min(255, round(channel * 1.18 + 8)) for channel in color]
+        color = separate(color, seen)
         seen.append(color)
         raw_values[key] = color
     values = {key: readable(color, background, 7.0) for key, color in raw_values.items()}
