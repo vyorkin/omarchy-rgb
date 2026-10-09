@@ -405,18 +405,31 @@ shaped = [
 print("".join(f"{value:02x}" for value in shaped))
 PY
 )
+    # Путь к быстрому помощнику, который пишет цвет через уже поднятый сервер.
+    #
+    # Пустая строка — нормальный ответ: помощника может не быть, и тогда вызывающий
+    # уходит на медленный путь. Но код возврата тут обязан быть нулевым. Раньше на
+    # этом месте стояла подстановка, последней командой которой была проверка файла
+    # через "[[ -f ... ]] && printf", и отсутствие помощника давало код 1, а set -e
+    # превращал его в выход всего хука: подсветка молча оставалась как была.
+    openrgb_helper() {
+        local binary resolved dir
+        binary=$(command -v omarchy-rgb 2>/dev/null) || return 0
+        resolved=$(readlink -f "$binary" 2>/dev/null) || return 0
+        dir=$(dirname "$resolved")
+        if [[ -f $dir/openrgb-fast.py ]]; then
+            printf '%s' "$dir/openrgb-fast.py"
+        fi
+        return 0
+    }
+
     # RAM (ENE DRAM) в список не входит намеренно.
     #
     # Плата красится в ФОНЕ: запись через сервер занимает около секунды на
     # устройство, и, если делать её здесь, подсветка водянки (следующий шаг)
     # отстаёт на эти секунды. Цвет платы задаётся цветом режима — массив
     # светодиодов не трогаем, иначе железо показывает то, что записано последним.
-    board_writer=$(
-        binary=$(command -v omarchy-rgb 2>/dev/null) || exit 0
-        resolved=$(readlink -f "$binary" 2>/dev/null) || exit 0
-        dir=$(dirname "$resolved")
-        [[ -f $dir/openrgb-fast.py ]] && printf '%s' "$dir/openrgb-fast.py"
-    )
+    board_writer=$(openrgb_helper)
     (
         wrote=no
         # Видеокарту не пишем: OpenRGB её не контролирует (устройство остаётся Off),
@@ -438,12 +451,7 @@ PY
     # Сервер OpenRGB поднимаем в фоне: в следующий раз запись цвета пойдёт через
     # него и будет занимать доли секунды. Устройства при этом не сканируются
     # заново, потому что пишем по имени.
-    fast_plugin=$(
-        binary=$(command -v omarchy-rgb 2>/dev/null) || exit 0
-        resolved=$(readlink -f "$binary" 2>/dev/null) || exit 0
-        dir=$(dirname "$resolved")
-        [[ -f $dir/openrgb-fast.py ]] && printf '%s' "$dir/openrgb-fast.py"
-    )
+    fast_plugin=$(openrgb_helper)
     if [[ -n $fast_plugin ]]; then
         python3 "$fast_plugin" warmup "$BOARD_DEVICE" >/dev/null 2>&1 &
     fi
