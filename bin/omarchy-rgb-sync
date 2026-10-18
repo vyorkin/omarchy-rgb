@@ -159,8 +159,14 @@ old = open(path, encoding="utf-8").read() if os.path.exists(path) else ""
 shutil.copytree(src, dst, dirs_exist_ok=True, ignore=shutil.ignore_patterns("theme.json"))
 
 theme = json.load(open(os.path.join(src, "theme.json"), encoding="utf-8"))
+# Панель висит вверх ногами относительно своего нативного кадра, а родная
+# ориентация модели — как раз reverse-portrait. Значит, 180 градусов даёт
+# portrait: bezel поворачивает кадр темы на число четвертей до родного кадра.
+# С reverse-portrait поворота нет вовсе, и тема выходит на панели перевёрнутой.
+# Шаблон (turing-8.8-vertical) уже portrait, но ориентацию ставим явно: от неё
+# зависит, какой стороной панель покажет тему.
 theme["name"] = "Omarchy 8.8"
-theme["orientation"] = "reverse-portrait"
+theme["orientation"] = "portrait"
 theme = recolor(theme)
 new = json.dumps(theme, ensure_ascii=False, indent=2) + "\n"
 

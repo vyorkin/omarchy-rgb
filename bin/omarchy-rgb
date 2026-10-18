@@ -207,8 +207,24 @@ def make_guard():
     return guard
 
 
+# Кэш годен, только пока демон тот же и его версия совпадает с той, что мы
+# заявляем клиентом. После обновления пакета в кэше остаётся прежняя версия, и
+# демон отвергает каждую запись с "Changes are disabled" — свет в этом случае не
+# менялся вообще, пока кэш не удаляли руками. Сверка стоит одного дешёвого
+# round trip по локальному сокету.
+def guard_matches_daemon(candidate):
+    if not candidate.get("instance_id"):
+        return False
+    info = call({"method": "GetDaemonInfo"})
+    if info.get("status") != "ok":
+        return False
+    data = info["data"]
+    return (candidate.get("client_version") == data.get("version")
+            and candidate.get("instance_id") == data.get("instance_id"))
+
+
 cached = read_json(guard_cache)
-guard = cached if cached.get("instance_id") else make_guard()
+guard = cached if guard_matches_daemon(cached) else make_guard()
 failures = []
 if not guard:
     print("daemon did not answer")
@@ -244,13 +260,28 @@ def reconnect():
     return connection is not None
 
 
+def stale_guard(response):
+    """Отказ из-за устаревшего guard, а не из-за самого запроса.
+
+    Демон помечает такой отказ машинным ключом `ui.key`, и «Changes are disabled»
+    при расхождении версий — это тот же случай: кэш остался от прежнего клиента.
+    Раньше сравнение шло только по тексту сообщения, ключа в списке не было, и
+    обновление пакета тихо отключало всю запись."""
+    key = str((response.get("ui") or {}).get("key") or "")
+    if key.startswith("gui.compatibility"):
+        return True
+    message = str(response.get("message", "")).lower()
+    return any(
+        marker in message
+        for marker in ("daemon changed", "incompatible", "not found", "reach", "changes are disabled")
+    )
+
+
 def write(request):
     """Пишет запрос, а при устаревшем guard или мёртвом сокете пробует ещё раз."""
     response = call(request, connection)
     message = str(response.get("message", "")).lower()
-    if response.get("status") != "ok" and any(
-        marker in message for marker in ("daemon changed", "incompatible", "not found", "reach")
-    ):
+    if response.get("status") != "ok" and stale_guard(response):
         if reconnect():
             response = call(request, connection)
         message = str(response.get("message", "")).lower()
